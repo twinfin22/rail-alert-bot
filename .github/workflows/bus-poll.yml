@@ -12,4 +12,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run poll bus
-        env: { RAIL_WORKER_URL: ${{ secrets.RAIL_WORKER_URL }}, INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }} }
+        env:
+          RAIL_WORKER_URL: ${{ secrets.RAIL_WORKER_URL }}
+          INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}

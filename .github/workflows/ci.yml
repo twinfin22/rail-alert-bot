@@ -1,5 +1,5 @@
 name: CI
-on: [push, pull_request]
+"on": [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -22,7 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     steps:
-      - run: curl --fail --silent --show-error "$RAIL_WORKER_URL/internal/health" -H "Authorization: Bearer $INTERNAL_API_SECRET"
+      - run: |
+          curl --fail --silent --show-error "$RAIL_WORKER_URL/internal/health" \
+            -H "Authorization: Bearer $INTERNAL_API_SECRET"
         env:
           RAIL_WORKER_URL: ${{ secrets.RAIL_WORKER_URL }}
           INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}
