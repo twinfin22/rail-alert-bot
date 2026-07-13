@@ -5,7 +5,7 @@ compatibility_date = "2026-07-13"
 [[d1_databases]]
 binding = "DB"
 database_name = "rail-alert-bot-db"
-database_id = "REPLACE_WITH_PRODUCTION_D1_ID"
+database_id = "553c6aa3-fd72-41df-b4d4-d862e6240a50"
 migrations_dir = "migrations"
 
 [env.staging]
@@ -13,5 +13,5 @@ name = "rail-alert-bot-staging"
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "rail-alert-bot-staging-db"
-database_id = "REPLACE_WITH_STAGING_D1_ID"
+database_id = "fd8c7314-410b-4faf-93c8-2c5f7d6ea6d5"
 migrations_dir = "migrations"
