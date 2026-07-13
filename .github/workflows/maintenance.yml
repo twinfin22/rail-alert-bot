@@ -1,0 +1,8 @@
+name: Maintenance
+on: { schedule: [{ cron: '*/5 * * * *' }], workflow_dispatch: {} }
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl --fail --silent --show-error -X POST "$RAIL_WORKER_URL/internal/maintenance" -H "Authorization: Bearer $INTERNAL_API_SECRET"
+        env: { RAIL_WORKER_URL: ${{ secrets.RAIL_WORKER_URL }}, INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }} }

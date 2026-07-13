@@ -1,0 +1,3 @@
+This project contains a small read-only KTX search adapter derived from
+https://github.com/NomaDamas/k-skill at commit 0c1bcdc9288545297897b0eee349d30ab2e1b230.
+Upstream license: MIT. No reservation, payment, cancellation, or CLI code is included.

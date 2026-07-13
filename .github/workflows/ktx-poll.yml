@@ -1,0 +1,16 @@
+name: KTX poll
+on: { schedule: [{ cron: '*/5 * * * *' }], workflow_dispatch: {} }
+concurrency: { group: rail-alert-ktx-poll, cancel-in-progress: false }
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: bun install --frozen-lockfile
+      - run: python -m pip install --require-hashes -r requirements-ktx.txt
+      - run: bun run poll ktx
+        env: { RAIL_WORKER_URL: ${{ secrets.RAIL_WORKER_URL }}, INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}, KSKILL_KTX_ID: ${{ secrets.KSKILL_KTX_ID }}, KSKILL_KTX_PASSWORD: ${{ secrets.KSKILL_KTX_PASSWORD }} }
