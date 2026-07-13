@@ -1,5 +1,6 @@
 name: KTX poll
-on: [workflow_dispatch]
+"on":
+  workflow_dispatch:
 concurrency: { group: rail-alert-ktx-poll, cancel-in-progress: false }
 jobs:
   poll:

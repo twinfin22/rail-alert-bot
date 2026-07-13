@@ -1,5 +1,6 @@
 name: SRT poll
-on: [workflow_dispatch]
+"on":
+  workflow_dispatch:
 concurrency: { group: rail-alert-srt-poll, cancel-in-progress: false }
 jobs:
   poll:
