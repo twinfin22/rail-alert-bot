@@ -1,6 +1,10 @@
 name: KTX poll
 "on":
   workflow_dispatch:
+  # One-time registry refresh: runs only when this workflow file changes on main.
+  push:
+    branches: [main]
+    paths: [.github/workflows/ktx-poll.yml]
 concurrency: { group: rail-alert-ktx-poll, cancel-in-progress: false }
 jobs:
   poll:
