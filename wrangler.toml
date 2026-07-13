@@ -10,6 +10,10 @@ migrations_dir = "migrations"
 
 [env.staging]
 name = "rail-alert-bot-staging"
+
+[env.staging.vars]
+RAIL_TELEGRAM_USERNAME = "srt_suseo_alert_bot"
+
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "rail-alert-bot-staging-db"
