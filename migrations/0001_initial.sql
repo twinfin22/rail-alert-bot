@@ -3,10 +3,13 @@ CREATE TABLE chats (chat_id INTEGER PRIMARY KEY, telegram_user_id INTEGER NOT NU
 CREATE TABLE invites (code_hash TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('admin','user')), expires_at TEXT NOT NULL, used_at TEXT, created_by INTEGER);
 CREATE TABLE updates (bot TEXT NOT NULL, update_id INTEGER NOT NULL, processed_at TEXT NOT NULL, PRIMARY KEY(bot, update_id));
 CREATE TABLE conversations (telegram_user_id INTEGER NOT NULL, bot TEXT NOT NULL, state_json TEXT NOT NULL, expires_at TEXT NOT NULL, PRIMARY KEY(telegram_user_id, bot));
-CREATE TABLE watches (id TEXT PRIMARY KEY, telegram_user_id INTEGER NOT NULL, provider TEXT NOT NULL CHECK(provider IN ('bus','srt','ktx')), query_json TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+CREATE TABLE watches (id TEXT PRIMARY KEY, telegram_user_id INTEGER NOT NULL, provider TEXT NOT NULL CHECK(provider IN ('bus','srt','ktx')), query_key TEXT NOT NULL, query_json TEXT NOT NULL, created_at TEXT NOT NULL, last_polled_at TEXT, expires_at TEXT NOT NULL);
 CREATE INDEX watches_provider_expiry ON watches(provider, expires_at);
+CREATE INDEX watches_provider_query ON watches(provider, query_key);
 CREATE TABLE seat_states (watch_id TEXT NOT NULL, seat_key TEXT NOT NULL, available INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(watch_id, seat_key));
-CREATE TABLE poll_runs (run_id TEXT PRIMARY KEY, provider TEXT NOT NULL, lease_token_hash TEXT NOT NULL, leased_until TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, accepted_at TEXT);
+CREATE TABLE poll_runs (run_id TEXT PRIMARY KEY, provider TEXT NOT NULL, lease_token_hash TEXT NOT NULL, leased_until TEXT NOT NULL, claimed_query_keys TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL, created_at TEXT NOT NULL, accepted_at TEXT);
 CREATE INDEX poll_runs_provider_lease ON poll_runs(provider, leased_until);
+CREATE UNIQUE INDEX poll_runs_one_active_lease ON poll_runs(provider) WHERE status='leased';
 CREATE TABLE outbox (id TEXT PRIMARY KEY, bot TEXT NOT NULL, chat_id INTEGER NOT NULL, body_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, locked_until TEXT, last_error TEXT, created_at TEXT NOT NULL);
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
