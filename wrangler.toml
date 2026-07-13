@@ -15,6 +15,9 @@ migrations_dir = "migrations"
 [env.staging]
 name = "rail-alert-bot-staging"
 
+[env.staging.secrets]
+required = ["BUS_TELEGRAM_TOKEN", "RAIL_TELEGRAM_TOKEN", "BUS_WEBHOOK_SECRET", "RAIL_WEBHOOK_SECRET", "INTERNAL_API_SECRET"]
+
 [env.staging.vars]
 RAIL_TELEGRAM_USERNAME = "srt_suseo_alert_bot"
 
