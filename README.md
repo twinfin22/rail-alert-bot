@@ -13,8 +13,9 @@ Rail administrators use `/invite`, `/revoke TELEGRAM_USER_ID`, `/users`, `/pause
 1. Create separate staging and production D1 databases, then replace the two IDs in `wrangler.toml`.
 2. Apply migrations: `bunx wrangler d1 migrations apply rail-alert-bot-staging-db --env staging`.
 3. Set Worker secrets in each environment: `BUS_TELEGRAM_TOKEN`, `RAIL_TELEGRAM_TOKEN`, `BUS_WEBHOOK_SECRET`, `RAIL_WEBHOOK_SECRET`, and `INTERNAL_API_SECRET`. Set `RAIL_TELEGRAM_USERNAME` as a non-secret Worker variable.
-4. Set GitHub environment secrets. Actions receive only `RAIL_WORKER_URL`, `INTERNAL_API_SECRET`, and KTX credentials; Telegram tokens remain Worker-only.
+4. Set GitHub environment secrets. Actions receive only `RAIL_WORKER_URL`, `INTERNAL_API_SECRET`, and KTX credentials; Telegram tokens remain Worker-only. Before approval, poll and maintenance workflows accept manual `staging` dispatch only. Add their 5-minute production schedules only in the approved cutover change.
 5. Deploy staging and register webhooks with Telegram's `secret_token`. Do not change production webhooks until staging tests are reported and approved.
+6. After staging deploy, issue exactly one 30-minute first-admin link: `RAIL_WORKER_URL=... INTERNAL_API_SECRET=... bun run bootstrap:admin`. Open it in the Rail bot's private chat. The endpoint refuses use after an administrator exists.
 
 ## Checks
 

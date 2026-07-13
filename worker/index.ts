@@ -24,6 +24,7 @@ export default {
     if (path === "/internal/polls/claim" && request.method === "POST") return internal(request, env, () => claim(request, env));
     if (path === "/internal/polls/result" && request.method === "POST") return internal(request, env, () => result(request, env));
     if (path === "/internal/maintenance" && request.method === "POST") return internal(request, env, () => maintenance(env));
+    if (path === "/internal/admin/bootstrap" && request.method === "POST") return internal(request, env, () => bootstrapAdmin(env));
     if (path === "/telegram/bus" && request.method === "POST") return telegram(request, env, "bus");
     if ((path === "/telegram/rail" || path === "/telegram/srt") && request.method === "POST") return telegram(request, env, "rail");
     return new Response("not found", { status: 404 });
@@ -111,15 +112,30 @@ async function chooseRailProvider(env: Env, userId: number, chatId: number, prov
 }
 
 async function createInvite(env: Env, userId: number, chatId: number, kind: "admin" | "user", hours: number): Promise<void> {
-  const code = crypto.randomUUID().replaceAll("-", "");
-  await env.DB.prepare("INSERT INTO invites(code_hash,kind,expires_at,created_by) VALUES(?,?,?,?)").bind(await sha256(code), kind, new Date(Date.now() + hours * 3_600_000).toISOString(), userId).run();
+  const link = await issueInvite(env, kind, hours, userId);
+  if (!link) return send(env, "rail", chatId, "RAIL_TELEGRAM_USERNAME is not configured.");
+  return send(env, "rail", chatId, link);
+}
+
+async function issueInvite(env: Env, kind: "admin" | "user", hours: number, createdBy: number | null): Promise<string | null> {
   const username = env.RAIL_TELEGRAM_USERNAME;
-  if (!username) return send(env, "rail", chatId, "Invite created but RAIL_TELEGRAM_USERNAME is not configured.");
-  return send(env, "rail", chatId, `https://t.me/${username}?start=${kind === "admin" ? "admin" : "invite"}_${code}`);
+  if (!username) return null;
+  const code = crypto.randomUUID().replaceAll("-", "");
+  if (kind === "admin") await env.DB.prepare("UPDATE invites SET used_at=? WHERE kind='admin' AND used_at IS NULL").bind(now()).run();
+  await env.DB.prepare("INSERT INTO invites(code_hash,kind,expires_at,created_by) VALUES(?,?,?,?)").bind(await sha256(code), kind, new Date(Date.now() + hours * 3_600_000).toISOString(), createdBy).run();
+  return `https://t.me/${username}?start=${kind === "admin" ? "admin" : "invite"}_${code}`;
+}
+
+async function bootstrapAdmin(env: Env): Promise<Response> {
+  const admin = await env.DB.prepare("SELECT telegram_user_id FROM users WHERE is_admin=1 LIMIT 1").first();
+  if (admin) return json({ error: "administrator already configured" }, 409);
+  const link = await issueInvite(env, "admin", 0.5, null);
+  if (!link) return json({ error: "RAIL_TELEGRAM_USERNAME is not configured" }, 503);
+  return json({ bootstrap_url: link, expires_in_seconds: 1800 });
 }
 
 async function createWatch(env: Env, bot: Bot, userId: number, chatId: number, text: string): Promise<void> {
-  if (await registrationPaused(env)) return send(env, bot, chatId, "New registrations are temporarily paused.");
+  if (!(await registrationOpen(env))) return send(env, bot, chatId, "New registrations are temporarily paused.");
   const parsed = parseWatch(text);
   if (!parsed) return send(env, bot, chatId, "Bus: /watch bus txbus FROM_CODE TO_CODE YYYYMMDD; KOBUS: /watch bus kobus FROM_CODE FROM_NAME TO_CODE TO_NAME YYYYMMDD. Rail: /watch srt FROM TO YYYYMMDD HHMM HHMM or /watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all.");
   if ((parsed.provider === "bus") !== (bot === "bus")) return send(env, bot, chatId, "Use the matching bot for this watch.");
@@ -199,11 +215,15 @@ async function claim(request: Request, env: Env): Promise<Response> {
   const body = await bodyJson<{ provider?: Provider; run_id?: string }>(request);
   if (!body || !validProvider(body.provider) || !validRunId(body.run_id)) return json({ error: "bad request" }, 400);
   const timestamp = now();
+  const expired = await env.DB.prepare("SELECT run_id FROM poll_runs WHERE status='leased' AND leased_until<?").bind(timestamp).all<{ run_id: string }>();
   await env.DB.prepare("UPDATE poll_runs SET status='expired' WHERE status='leased' AND leased_until<?").bind(timestamp).run();
-  const rows = await env.DB.prepare("SELECT query_key,query_json FROM watches WHERE provider=? AND expires_at>? GROUP BY query_key,query_json ORDER BY COALESCE(MIN(last_polled_at), MIN(created_at)) LIMIT 50").bind(body.provider, timestamp).all<{ query_key: string; query_json: string }>();
+  for (const _ of expired.results) await incrementSetting(env, "slow_run_streak");
+  const limit = 10;
+  const rows = await env.DB.prepare("SELECT query_key,query_json FROM watches WHERE provider=? AND expires_at>? GROUP BY query_key,query_json ORDER BY COALESCE(MIN(last_polled_at), MIN(created_at)) LIMIT ?").bind(body.provider, timestamp, limit + 1).all<{ query_key: string; query_json: string }>();
+  await writeSetting(env, `poll_backlog_${body.provider}`, Math.max(0, rows.results.length - limit));
   if (rows.results.length === 0) return json({ claimed: false, reason: "no_work" });
   const work: ClaimedWork[] = [];
-  for (const row of rows.results) {
+  for (const row of rows.results.slice(0, limit)) {
     try { work.push({ query_key: row.query_key, query: JSON.parse(row.query_json) }); } catch { return json({ error: "corrupt watch" }, 500); }
   }
   const lease = crypto.randomUUID();
@@ -217,14 +237,17 @@ async function claim(request: Request, env: Env): Promise<Response> {
 async function result(request: Request, env: Env): Promise<Response> {
   const body = await bodyJson<{ run_id?: string; lease_token?: string; provider?: Provider; observations?: unknown }>(request);
   if (!body || !validProvider(body.provider) || !validRunId(body.run_id) || typeof body.lease_token !== "string" || !validObservations(body.observations)) return json({ error: "bad request" }, 400);
-  const run = await env.DB.prepare("SELECT lease_token_hash,leased_until,status,provider,claimed_query_keys FROM poll_runs WHERE run_id=?").bind(body.run_id).first<{ lease_token_hash: string; leased_until: string; status: string; provider: Provider; claimed_query_keys: string }>();
+  const run = await env.DB.prepare("SELECT lease_token_hash,leased_until,status,provider,claimed_query_keys,created_at FROM poll_runs WHERE run_id=?").bind(body.run_id).first<{ lease_token_hash: string; leased_until: string; status: string; provider: Provider; claimed_query_keys: string; created_at: string }>();
   if (!run || run.status !== "leased" || run.provider !== body.provider || run.leased_until <= now() || !constantTimeEqual(await sha256(body.lease_token), run.lease_token_hash)) return json({ accepted: false }, 409);
   let expected: string[];
   try { expected = JSON.parse(run.claimed_query_keys); } catch { return json({ accepted: false }, 409); }
   const actual = body.observations.map((observation) => observation.query_key).sort();
   if (expected.sort().join(",") !== actual.join(",")) return json({ accepted: false, error: "incomplete result" }, 409);
   const alerts = await applyObservations(env, body.provider, body.observations);
-  await env.DB.prepare("UPDATE poll_runs SET status='accepted',accepted_at=? WHERE run_id=? AND status='leased'").bind(now(), body.run_id).run();
+  const acceptedAt = now();
+  const durationMs = Math.max(0, Date.parse(acceptedAt) - Date.parse(run.created_at));
+  await env.DB.prepare("UPDATE poll_runs SET status='accepted',accepted_at=?,duration_ms=? WHERE run_id=? AND status='leased'").bind(acceptedAt, durationMs, body.run_id).run();
+  await recordSuccessfulRun(env, durationMs);
   return json({ accepted: true, observation_count: body.observations.length, alert_count: alerts });
 }
 
@@ -252,6 +275,7 @@ async function applyObservations(env: Env, provider: Provider, observations: Que
 
 async function maintenance(env: Env): Promise<Response> {
   const timestamp = now();
+  const expired = await env.DB.prepare("SELECT run_id FROM poll_runs WHERE status='leased' AND leased_until<?").bind(timestamp).all<{ run_id: string }>();
   await env.DB.batch([
     env.DB.prepare("UPDATE poll_runs SET status='expired' WHERE status='leased' AND leased_until<?").bind(timestamp),
     env.DB.prepare("DELETE FROM watches WHERE expires_at<?").bind(timestamp),
@@ -259,8 +283,9 @@ async function maintenance(env: Env): Promise<Response> {
     env.DB.prepare("DELETE FROM seat_states WHERE watch_id NOT IN (SELECT id FROM watches)"),
     env.DB.prepare("UPDATE outbox SET status='dead-letter' WHERE attempts>=5 AND status='pending'"),
   ]);
+  for (const _ of expired.results) await incrementSetting(env, "slow_run_streak");
   await flushOutbox(env);
-  return json({ ok: true });
+  return json({ ok: true, expired_leases: expired.results.length });
 }
 
 async function flushOutbox(env: Env): Promise<void> {
@@ -283,13 +308,79 @@ async function flushOutbox(env: Env): Promise<void> {
 }
 
 async function status(env: Env): Promise<Record<string, unknown>> {
-  const [backlog, dead, active, paused] = await Promise.all([
+  const [outbox, dead, active, paused, slowRuns, providerBacklogs, providerHealth] = await Promise.all([
     env.DB.prepare("SELECT COUNT(*) AS count FROM outbox WHERE status='pending'").first<{ count: number }>(),
     env.DB.prepare("SELECT COUNT(*) AS count FROM outbox WHERE status='dead-letter'").first<{ count: number }>(),
     env.DB.prepare("SELECT provider,COUNT(*) AS count FROM poll_runs WHERE status='leased' AND leased_until>? GROUP BY provider").bind(now()).all<{ provider: string; count: number }>(),
     registrationPaused(env),
+    settingNumber(env, "slow_run_streak"),
+    Promise.all((["bus", "srt", "ktx"] as Provider[]).map(async (provider) => [provider, await settingNumber(env, `poll_backlog_${provider}`)] as const)),
+    pollHealth(env),
   ]);
-  return { backlog: backlog?.count ?? 0, dead_letter: dead?.count ?? 0, active_leases: active.results, registration_open: !paused && canRegister(backlog?.count ?? 0, 0) };
+  const backlogByProvider = Object.fromEntries(providerBacklogs) as Record<Provider, number>;
+  const pending = Object.values(backlogByProvider).reduce((total, count) => total + count, 0);
+  return { backlog: pending, provider_backlog: backlogByProvider, outbox_backlog: outbox?.count ?? 0, dead_letter: dead?.count ?? 0, active_leases: active.results, provider_health: providerHealth, slow_run_streak: slowRuns, registration_open: !paused && canRegister(pending, slowRuns) };
+}
+
+async function registrationOpen(env: Env): Promise<boolean> {
+  if (await registrationPaused(env)) return false;
+  const [backlog, slowRuns] = await Promise.all([
+    totalPollBacklog(env),
+    settingNumber(env, "slow_run_streak"),
+  ]);
+  return canRegister(backlog, slowRuns);
+}
+
+async function totalPollBacklog(env: Env): Promise<number> {
+  const values = await Promise.all((["bus", "srt", "ktx"] as Provider[]).map((provider) => settingNumber(env, `poll_backlog_${provider}`)));
+  return values.reduce((total, value) => total + value, 0);
+}
+
+async function settingNumber(env: Env, key: string): Promise<number> {
+  const setting = await env.DB.prepare("SELECT value FROM settings WHERE key=?").bind(key).first<{ value: string }>();
+  const parsed = Number(setting?.value ?? "0");
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+async function incrementSetting(env: Env, key: string): Promise<number> {
+  const value = (await settingNumber(env, key)) + 1;
+  await writeSetting(env, key, value);
+  return value;
+}
+
+async function writeSetting(env: Env, key: string, value: number): Promise<void> {
+  await env.DB.prepare("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(key, String(value), now()).run();
+}
+
+async function recordSuccessfulRun(env: Env, durationMs: number): Promise<void> {
+  if (durationMs >= 180_000) {
+    await env.DB.prepare("INSERT INTO settings(key,value,updated_at) VALUES('fast_run_streak','0',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(now()).run();
+    return;
+  }
+  const fastRuns = await incrementSetting(env, "fast_run_streak");
+  if (fastRuns < 2) return;
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO settings(key,value,updated_at) VALUES('slow_run_streak','0',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(now()),
+    env.DB.prepare("INSERT INTO settings(key,value,updated_at) VALUES('fast_run_streak','0',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(now()),
+  ]);
+}
+
+async function pollHealth(env: Env): Promise<Record<Provider, Record<string, unknown>>> {
+  const result = {} as Record<Provider, Record<string, unknown>>;
+  for (const provider of ["bus", "srt", "ktx"] as Provider[]) {
+    const runs = await env.DB.prepare("SELECT status,created_at,accepted_at,duration_ms FROM poll_runs WHERE provider=? ORDER BY created_at DESC LIMIT 50").bind(provider).all<{ status: string; created_at: string; accepted_at: string | null; duration_ms: number | null }>();
+    const latest = runs.results[0];
+    const success = runs.results.find((run) => run.status === "accepted");
+    result[provider] = {
+      last_request_at: latest?.created_at ?? null,
+      last_status: latest?.status ?? null,
+      last_success_at: success?.accepted_at ?? null,
+      last_latency_ms: success?.duration_ms ?? null,
+      success_lag_ms: success?.accepted_at ? Math.max(0, Date.now() - Date.parse(success.accepted_at)) : null,
+      last_error: latest?.status === "expired" ? "lease expired" : null,
+    };
+  }
+  return result;
 }
 
 async function health(env: Env): Promise<Response> { return json(await status(env)); }

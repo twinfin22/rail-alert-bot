@@ -5,8 +5,11 @@
   "type": "module",
   "scripts": {
     "test": "bun test",
+    "test:ktx": "python3 -m unittest ktx/test_search.py",
     "typecheck": "tsc --noEmit",
     "check:forbidden": "! grep -RInE '(reserve|cancel|payment|purchase|booking|예약|취소|결제)' --include='*.py' --include='*.ts' ktx src worker scripts",
+    "bootstrap:admin": "bun scripts/bootstrap-admin.ts",
+    "build": "node node_modules/wrangler/bin/wrangler.js deploy --dry-run --env staging",
     "poll": "bun src/poll.ts",
     "deploy:staging": "node node_modules/wrangler/bin/wrangler.js deploy --env staging",
     "deploy": "node node_modules/wrangler/bin/wrangler.js deploy"

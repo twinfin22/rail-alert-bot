@@ -27,8 +27,9 @@ export class FakeD1 {
   readonly db = new Database(":memory:");
 
   async migrate(): Promise<void> {
-    const sql = await Bun.file("migrations/0001_initial.sql").text();
-    this.db.exec(sql);
+    for (const file of ["migrations/0001_initial.sql", "migrations/0002_poll_metrics.sql"]) {
+      this.db.exec(await Bun.file(file).text());
+    }
   }
 
   prepare(sql: string): FakeStatement {

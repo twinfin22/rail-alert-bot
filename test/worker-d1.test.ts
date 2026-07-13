@@ -31,6 +31,28 @@ test("invites grant access once and reject reuse or expiry", async () => {
   expect(await user(13)).toBeNull();
 });
 
+test("admin bootstrap is one-use and permanently unavailable after the first administrator", async () => {
+  const response = await internalResponse("/internal/admin/bootstrap", {});
+  expect(response.status).toBe(200);
+  const { bootstrap_url: link } = await response.json() as { bootstrap_url: string };
+  const code = new URL(link).searchParams.get("start")!.slice("admin_".length);
+  await railUpdate(4, 14, `/start admin_${code}`);
+  expect(await user(14)).toEqual({ telegram_user_id: 14, is_admin: 1 });
+  expect((await internalResponse("/internal/admin/bootstrap", {})).status).toBe(409);
+});
+
+test("forged and replayed Telegram updates are rejected before command handling", async () => {
+  const forged = await worker.fetch(new Request("https://worker.test/telegram/rail", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "not json",
+  }), env);
+  expect(forged.status).toBe(403);
+
+  await railUpdate(5, 15, "/help");
+  await railUpdate(5, 15, "/help");
+  const outbox = await d1.prepare("SELECT COUNT(*) AS count FROM outbox").first<{ count: number }>();
+  expect(outbox?.count).toBe(1);
+});
+
 test("rail start creates conversation and srt watch registration is real", async () => {
   await allowUser(21);
   await railUpdate(10, 21, "/start");
@@ -55,6 +77,39 @@ test("expired leases are reclaimed and active leases block overlap", async () =>
   expect(reclaimed.claimed).toBe(true);
   const expired = await d1.prepare("SELECT status FROM poll_runs WHERE run_id='run-1'").first<{ status: string }>();
   expect(expired?.status).toBe("expired");
+});
+
+test("expired, duplicate, and stale results are rejected", async () => {
+  const queryKey = await insertWatch("w-result", 32, "srt", { departure: "수서", arrival: "부산", date: watchDate(), start_time: "0600", end_time: "0900" });
+  const claim = await internal("/internal/polls/claim", { provider: "srt", run_id: "result-1" });
+  const payload = { provider: "srt", run_id: "result-1", lease_token: claim.lease_token, observations: [{ query_key: queryKey, seats: [] }] };
+  expect((await internal("/internal/polls/result", payload)).accepted).toBe(true);
+  expect((await internal("/internal/polls/result", payload)).accepted).toBe(false);
+
+  const second = await internal("/internal/polls/claim", { provider: "srt", run_id: "result-2" });
+  await d1.prepare("UPDATE poll_runs SET leased_until=? WHERE run_id='result-2'").bind(past()).run();
+  const stale = await internal("/internal/polls/result", { ...payload, run_id: "result-2", lease_token: second.lease_token });
+  expect(stale.accepted).toBe(false);
+});
+
+test("two expired leases pause registration until two fast successful runs recover it", async () => {
+  const queryKey = await insertWatch("w-overload", 33, "srt", { departure: "수서", arrival: "부산", date: watchDate(), start_time: "0600", end_time: "0900" });
+  for (const runId of ["slow-1", "slow-2"]) {
+    await internal("/internal/polls/claim", { provider: "srt", run_id: runId });
+    await d1.prepare("UPDATE poll_runs SET leased_until=? WHERE run_id=?").bind(past(), runId).run();
+    await internal("/internal/maintenance", {});
+  }
+  await railUpdate(22, 33, `/watch srt 수서 부산 ${watchDate()} 0600 0900`);
+  expect(await lastOutboxText()).toBe("New registrations are temporarily paused.");
+
+  for (const runId of ["fast-1", "fast-2"]) {
+    const claim = await internal("/internal/polls/claim", { provider: "srt", run_id: runId });
+    const result = await internal("/internal/polls/result", { provider: "srt", run_id: runId, lease_token: claim.lease_token, observations: [{ query_key: queryKey, seats: [] }] });
+    expect(result.accepted).toBe(true);
+  }
+  await railUpdate(23, 33, `/watch srt 수서 부산 ${watchDate()} 0600 0900`);
+  const watches = await d1.prepare("SELECT COUNT(*) AS count FROM watches WHERE telegram_user_id=33").first<{ count: number }>();
+  expect(watches?.count).toBe(2);
 });
 
 test("state transitions enqueue only unavailable to available alerts", async () => {
@@ -103,12 +158,15 @@ async function railUpdate(updateId: number, userId: number, text: string): Promi
 }
 
 async function internal(path: string, body: unknown): Promise<any> {
-  const response = await worker.fetch(new Request(`https://worker.test${path}`, {
+  return (await internalResponse(path, body)).json();
+}
+
+async function internalResponse(path: string, body: unknown): Promise<Response> {
+  return worker.fetch(new Request(`https://worker.test${path}`, {
     method: "POST",
     headers: { Authorization: "Bearer internal-secret", "Content-Type": "application/json" },
     body: JSON.stringify(body),
   }), env);
-  return response.json();
 }
 
 async function insertInvite(code: string, kind: "admin" | "user", expiresAt: string): Promise<void> {

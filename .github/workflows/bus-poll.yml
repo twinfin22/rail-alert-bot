@@ -1,10 +1,14 @@
 name: Bus poll
-on: { schedule: [{ cron: '*/5 * * * *' }], workflow_dispatch: {} }
+on:
+  workflow_dispatch:
+    inputs:
+      environment: { description: 'staging only until production cutover is approved', required: true, type: choice, options: [staging] }
 concurrency: { group: rail-alert-bus-poll, cancel-in-progress: false }
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2

@@ -22,7 +22,7 @@ if (!claim.claimed) process.exit(0);
 // Provider adapters run read-only searches. Never receive Telegram user IDs or tokens.
 const work = claim.work as Work[];
 if (!Array.isArray(work) || work.length === 0) process.exit(0);
-const observations = provider === "ktx" ? await observeKtxBatch(work) : await Promise.all(work.map((item) => observe(provider, item)));
+const observations = provider === "ktx" ? await observeKtxBatch(work) : await observeWithConcurrency(provider, work, 2);
 const completed = await api("/internal/polls/result", { provider, run_id: runId, lease_token: claim.lease_token, observations });
 if (!completed.accepted) throw new Error("result rejected");
 function required(name: string) { const value = process.env[name]; if (!value) throw new Error(`${name} required`); return value; }
@@ -59,6 +59,20 @@ async function observeSrt(workItem: Work): Promise<QueryObservation> {
       ];
     }),
   };
+}
+
+async function observeWithConcurrency(kind: Exclude<Provider, "ktx">, work: Work[], concurrency: number): Promise<QueryObservation[]> {
+  const observations: QueryObservation[] = [];
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = next++;
+      if (index >= work.length) return;
+      observations[index] = await observe(kind, work[index]!);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, work.length) }, worker));
+  return observations;
 }
 
 async function observeKtxBatch(work: Work[]): Promise<QueryObservation[]> {

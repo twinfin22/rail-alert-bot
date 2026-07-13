@@ -18,8 +18,8 @@ class KtxSearcher:
     def search(self, departure: str, arrival: str, date: str, start_time: str, end_time: str, room: str) -> list[dict[str, Any]]:
         if room not in {"general", "special", "all"}:
             raise ValueError("room must be general, special, or all")
-        start = start_time.zfill(6)
-        end = end_time.zfill(6)
+        start = f"{start_time}00"
+        end = f"{end_time}00"
         trains = self.client.search_train(departure, arrival, date, start, TrainType.KTX, include_no_seats=True)
         normalized = []
         for train in trains:
