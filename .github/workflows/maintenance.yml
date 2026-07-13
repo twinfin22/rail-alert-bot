@@ -1,6 +1,8 @@
 name: Maintenance
 "on":
   workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
 jobs:
   maintain:
     runs-on: ubuntu-latest

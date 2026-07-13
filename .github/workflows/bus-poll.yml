@@ -1,6 +1,8 @@
 name: Bus poll
 "on":
   workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
 concurrency: { group: rail-alert-bus-poll, cancel-in-progress: false }
 jobs:
   poll:
