@@ -10,4 +10,4 @@ jobs:
       - run: bun test
       - run: bun run typecheck
       - run: bun run check:forbidden
-      - run: bunx wrangler deploy --dry-run --env staging
+      - run: node node_modules/wrangler/bin/wrangler.js deploy --dry-run --env staging

@@ -79,19 +79,35 @@ async function handleCommand(env: Env, bot: Bot, userId: number, chatId: number,
     return send(env, bot, chatId, "Stopped.");
   }
   if (command === "/watch") return createWatch(env, bot, userId, chatId, text);
-  if (command === "/start") return send(env, bot, chatId, bot === "rail" ? "Use /watch srt or /watch ktx. /help has the command format." : "Use /watch bus. /help has the command format.");
+  if (bot === "rail" && command === "/start") return startRailFlow(env, userId, chatId);
+  if (bot === "rail" && ["srt", "ktx"].includes(text.toLowerCase())) return chooseRailProvider(env, userId, chatId, text.toLowerCase() as "srt" | "ktx");
+  if (command === "/start") return send(env, bot, chatId, "Use /watch bus. /help has the command format.");
 }
 
 async function useInvite(env: Env, userId: number, chatId: number, bot: Bot, code: string, kind: "admin" | "user"): Promise<void> {
-  const codeHash = await sha256(code);
-  const used = await env.DB.prepare("UPDATE invites SET used_at=? WHERE code_hash=? AND kind=? AND used_at IS NULL AND expires_at>?").bind(now(), codeHash, kind, now()).run();
-  if (!used.meta.changes) return send(env, bot, chatId, "Invalid or expired invite.");
   if (kind === "admin") {
     const admin = await env.DB.prepare("SELECT telegram_user_id FROM users WHERE is_admin=1 LIMIT 1").first();
     if (admin) return send(env, bot, chatId, "Administrator already configured.");
   }
+  const codeHash = await sha256(code);
+  const used = await env.DB.prepare("UPDATE invites SET used_at=? WHERE code_hash=? AND kind=? AND used_at IS NULL AND expires_at>?").bind(now(), codeHash, kind, now()).run();
+  if (!used.meta.changes) return send(env, bot, chatId, "Invalid or expired invite.");
   await env.DB.prepare("INSERT INTO users(telegram_user_id,allowed_at,is_admin) VALUES(?,?,?) ON CONFLICT(telegram_user_id) DO UPDATE SET allowed_at=excluded.allowed_at,is_admin=MAX(users.is_admin,excluded.is_admin)").bind(userId, now(), kind === "admin" ? 1 : 0).run();
   return send(env, bot, chatId, "Access granted.");
+}
+
+async function startRailFlow(env: Env, userId: number, chatId: number): Promise<void> {
+  await env.DB.prepare("INSERT INTO conversations(telegram_user_id,bot,state_json,expires_at) VALUES(?,?,?,?) ON CONFLICT(telegram_user_id,bot) DO UPDATE SET state_json=excluded.state_json,expires_at=excluded.expires_at")
+    .bind(userId, "rail", JSON.stringify({ step: "provider" }), new Date(Date.now() + 30 * 60_000).toISOString()).run();
+  return send(env, "rail", chatId, "Choose SRT or KTX. You can also register directly: /watch srt FROM TO YYYYMMDD HHMM HHMM or /watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all.");
+}
+
+async function chooseRailProvider(env: Env, userId: number, chatId: number, provider: "srt" | "ktx"): Promise<void> {
+  const conversation = await env.DB.prepare("SELECT state_json FROM conversations WHERE telegram_user_id=? AND bot='rail' AND expires_at>?").bind(userId, now()).first<{ state_json: string }>();
+  if (!conversation) return send(env, "rail", chatId, "Use /start first.");
+  await env.DB.prepare("UPDATE conversations SET state_json=?,expires_at=? WHERE telegram_user_id=? AND bot='rail'")
+    .bind(JSON.stringify({ step: "watch_command", provider }), new Date(Date.now() + 30 * 60_000).toISOString(), userId).run();
+  return send(env, "rail", chatId, provider === "srt" ? "Send: /watch srt FROM TO YYYYMMDD HHMM HHMM" : "Send: /watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all");
 }
 
 async function createInvite(env: Env, userId: number, chatId: number, kind: "admin" | "user", hours: number): Promise<void> {
@@ -107,7 +123,6 @@ async function createWatch(env: Env, bot: Bot, userId: number, chatId: number, t
   const parsed = parseWatch(text);
   if (!parsed) return send(env, bot, chatId, "Bus: /watch bus txbus FROM_CODE TO_CODE YYYYMMDD; KOBUS: /watch bus kobus FROM_CODE FROM_NAME TO_CODE TO_NAME YYYYMMDD. Rail: /watch srt FROM TO YYYYMMDD HHMM HHMM or /watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all.");
   if ((parsed.provider === "bus") !== (bot === "bus")) return send(env, bot, chatId, "Use the matching bot for this watch.");
-  if (parsed.provider !== "bus") return send(env, bot, chatId, "Rail polling is not enabled yet. Registration is blocked until its read-only adapter is deployed.");
   if (!isValidWatchDate(parsed.query.date)) return send(env, bot, chatId, "Date must be today through 30 days from today.");
   const limit = parsed.provider === "bus" ? MAX_BUS_WATCHES : MAX_RAIL_WATCHES;
   const count = await env.DB.prepare(parsed.provider === "bus" ? "SELECT COUNT(*) AS count FROM watches WHERE telegram_user_id=? AND provider='bus'" : "SELECT COUNT(*) AS count FROM watches WHERE telegram_user_id=? AND provider IN ('srt','ktx')").bind(userId).first<{ count: number }>();

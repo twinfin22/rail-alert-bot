@@ -6,10 +6,10 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "check:forbidden": "! grep -RInE '(reserve|cancel|payment|purchase)' --include='*.py' ktx src scripts",
+    "check:forbidden": "! grep -RInE '(reserve|cancel|payment|purchase|booking|예약|취소|결제)' --include='*.py' --include='*.ts' ktx src worker scripts",
     "poll": "bun src/poll.ts",
-    "deploy:staging": "wrangler deploy --env staging",
-    "deploy": "wrangler deploy"
+    "deploy:staging": "node node_modules/wrangler/bin/wrangler.js deploy --env staging",
+    "deploy": "node node_modules/wrangler/bin/wrangler.js deploy"
   },
   "dependencies": { "cheerio": "1.2.0" },
   "devDependencies": {

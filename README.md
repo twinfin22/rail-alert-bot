@@ -4,7 +4,7 @@ Read-only Bus, SRT, and KTX availability alerts. It does not contain booking, pa
 
 ## Current commands
 
-After access is granted, Bus accepts `/watch bus txbus FROM_CODE TO_CODE YYYYMMDD` and `/watch bus kobus FROM_CODE FROM_NAME TO_CODE TO_NAME YYYYMMDD`. The Worker validates the future Rail command formats, but blocks SRT/KTX registration until their read-only adapters are wired; this bootstrap does not create watches that cannot be polled. All dates must be today through 30 days away. `/list`, `/stop ID`, and `/delete` are available to every allowed user.
+After access is granted, Bus accepts `/watch bus txbus FROM_CODE TO_CODE YYYYMMDD` and `/watch bus kobus FROM_CODE FROM_NAME TO_CODE TO_NAME YYYYMMDD`. Rail accepts `/watch srt FROM TO YYYYMMDD HHMM HHMM` and `/watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all`. All dates must be today through 30 days away. `/list`, `/stop ID`, and `/delete` are available to every allowed user.
 
 Rail administrators use `/invite`, `/revoke TELEGRAM_USER_ID`, `/users`, `/pause`, `/resume`, and `/status`. Configure the non-secret Worker variable `RAIL_TELEGRAM_USERNAME` before issuing invite links.
 

@@ -8,5 +8,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
-      - run: bunx wrangler deploy ${{ inputs.environment == 'staging' && '--env staging' || '' }}
+      - run: node node_modules/wrangler/bin/wrangler.js deploy ${{ inputs.environment == 'staging' && '--env staging' || '' }}
         env: { CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}, CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }} }

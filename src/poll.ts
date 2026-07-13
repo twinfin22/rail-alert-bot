@@ -1,5 +1,6 @@
 import { getSchedule as getKobusSchedule } from "./bus-alert/scraper/kobus";
 import { getSchedule as getTxbusSchedule } from "./bus-alert/scraper/txbus";
+import { searchSrt } from "./srt/search";
 import type { QueryObservation } from "../worker/domain";
 
 type Provider = "bus" | "srt" | "ktx";
@@ -21,13 +22,14 @@ if (!claim.claimed) process.exit(0);
 // Provider adapters run read-only searches. Never receive Telegram user IDs or tokens.
 const work = claim.work as Work[];
 if (!Array.isArray(work) || work.length === 0) process.exit(0);
-const observations = await Promise.all(work.map((item) => observe(provider, item)));
+const observations = provider === "ktx" ? await observeKtxBatch(work) : await Promise.all(work.map((item) => observe(provider, item)));
 const completed = await api("/internal/polls/result", { provider, run_id: runId, lease_token: claim.lease_token, observations });
 if (!completed.accepted) throw new Error("result rejected");
 function required(name: string) { const value = process.env[name]; if (!value) throw new Error(`${name} required`); return value; }
 
 async function observe(kind: Provider, workItem: Work): Promise<QueryObservation> {
-  if (kind !== "bus") throw new Error(`${kind} provider adapter is not implemented`);
+  if (kind === "srt") return observeSrt(workItem);
+  if (kind === "ktx") throw new Error("ktx provider adapter must be called in batch mode");
   const query = workItem.query as { service?: string; departure_code?: string; departure_name?: string; arrival_code?: string; arrival_name?: string; date?: string };
   if (!query.departure_code || !query.arrival_code || !query.date) throw new Error("invalid claimed bus query");
   const schedules = query.service === "kobus"
@@ -41,4 +43,41 @@ async function observe(kind: Provider, workItem: Work): Promise<QueryObservation
       label: `${schedule.departureTime} ${schedule.busGrade} (${schedule.remainingSeats} seats)`,
     })),
   };
+}
+
+async function observeSrt(workItem: Work): Promise<QueryObservation> {
+  const query = workItem.query as { departure?: string; arrival?: string; date?: string; start_time?: string; end_time?: string };
+  if (!query.departure || !query.arrival || !query.date || !query.start_time || !query.end_time) throw new Error("invalid claimed SRT query");
+  const trains = await searchSrt({ departure: query.departure, arrival: query.arrival, date: query.date, start_time: query.start_time, end_time: query.end_time });
+  return {
+    query_key: workItem.query_key,
+    seats: trains.flatMap((train) => {
+      const base = `srt|${train.trainNo}|${train.date}|${train.depTime}`;
+      return [
+        { key: `${base}|general`, available: train.generalAvailable, label: `SRT ${train.trainNo} ${train.depTime} general (${train.generalState})` },
+        { key: `${base}|special`, available: train.specialAvailable, label: `SRT ${train.trainNo} ${train.depTime} special (${train.specialState})` },
+      ];
+    }),
+  };
+}
+
+async function observeKtxBatch(work: Work[]): Promise<QueryObservation[]> {
+  const process = Bun.spawn(["python", "ktx/observe.py"], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: processEnvForPython(),
+  });
+  process.stdin.write(JSON.stringify(work));
+  process.stdin.end();
+  const [exitCode, stdout, stderr] = await Promise.all([process.exited, new Response(process.stdout).text(), new Response(process.stderr).text()]);
+  if (exitCode !== 0) throw new Error(`KTX adapter failed: ${stderr.trim().slice(0, 300)}`);
+  const parsed = JSON.parse(stdout) as QueryObservation[];
+  return parsed;
+}
+
+function processEnvForPython(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
+  return env;
 }
