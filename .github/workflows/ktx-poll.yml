@@ -1,13 +1,10 @@
 name: KTX poll
-on:
-  workflow_dispatch:
-    inputs:
-      environment: { description: 'staging only until production cutover is approved', required: true, type: choice, options: [staging] }
+on: [workflow_dispatch]
 concurrency: { group: rail-alert-ktx-poll, cancel-in-progress: false }
 jobs:
   poll:
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+    environment: staging
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
