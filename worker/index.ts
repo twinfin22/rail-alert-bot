@@ -25,6 +25,7 @@ export default {
     if (path === "/internal/polls/result" && request.method === "POST") return internal(request, env, () => result(request, env));
     if (path === "/internal/maintenance" && request.method === "POST") return internal(request, env, () => maintenance(env));
     if (path === "/internal/admin/bootstrap" && request.method === "POST") return internal(request, env, () => bootstrapAdmin(env));
+    if (path === "/internal/webhooks/register" && request.method === "POST") return internal(request, env, () => registerWebhooks(request, env));
     if (path === "/telegram/bus" && request.method === "POST") return telegram(request, env, "bus");
     if ((path === "/telegram/rail" || path === "/telegram/srt") && request.method === "POST") return telegram(request, env, "rail");
     return new Response("not found", { status: 404 });
@@ -132,6 +133,28 @@ async function bootstrapAdmin(env: Env): Promise<Response> {
   const link = await issueInvite(env, "admin", 0.5, null);
   if (!link) return json({ error: "RAIL_TELEGRAM_USERNAME is not configured" }, 503);
   return json({ bootstrap_url: link, expires_in_seconds: 1800 });
+}
+
+async function registerWebhooks(request: Request, env: Env): Promise<Response> {
+  const origin = new URL(request.url).origin;
+  const registered = await Promise.all([
+    setWebhook(env.BUS_TELEGRAM_TOKEN, `${origin}/telegram/bus`, env.BUS_WEBHOOK_SECRET),
+    setWebhook(env.RAIL_TELEGRAM_TOKEN, `${origin}/telegram/rail`, env.RAIL_WEBHOOK_SECRET),
+  ]);
+  return registered.every(Boolean) ? json({ ok: true }) : json({ ok: false }, 502);
+}
+
+async function setWebhook(token: string, url: string, secret: string): Promise<boolean> {
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, secret_token: secret, allowed_updates: ["message"] }),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 async function createWatch(env: Env, bot: Bot, userId: number, chatId: number, text: string): Promise<void> {

@@ -41,6 +41,25 @@ test("admin bootstrap is one-use and permanently unavailable after the first adm
   expect((await internalResponse("/internal/admin/bootstrap", {})).status).toBe(409);
 });
 
+test("registers both Telegram webhooks through the authenticated internal endpoint", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; body: { url: string; secret_token: string; allowed_updates: string[] } }> = [];
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  }) as typeof fetch;
+  try {
+    const response = await internalResponse("/internal/webhooks/register", {});
+    expect(response.status).toBe(200);
+    expect(calls).toEqual([
+      { url: "https://api.telegram.org/botbus-token/setWebhook", body: { url: "https://worker.test/telegram/bus", secret_token: "bus-secret", allowed_updates: ["message"] } },
+      { url: "https://api.telegram.org/botrail-token/setWebhook", body: { url: "https://worker.test/telegram/rail", secret_token: "rail-secret", allowed_updates: ["message"] } },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("forged and replayed Telegram updates are rejected before command handling", async () => {
   const forged = await worker.fetch(new Request("https://worker.test/telegram/rail", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: "not json",

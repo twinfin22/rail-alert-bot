@@ -1,0 +1,16 @@
+name: Register staging Telegram webhooks
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - run: |
+          curl --fail --silent --show-error -X POST "$RAIL_WORKER_URL/internal/webhooks/register" \
+            -H "Authorization: Bearer $INTERNAL_API_SECRET"
+        env:
+          RAIL_WORKER_URL: ${{ secrets.RAIL_WORKER_URL }}
+          INTERNAL_API_SECRET: ${{ secrets.INTERNAL_API_SECRET }}
