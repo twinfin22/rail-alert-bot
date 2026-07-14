@@ -9,16 +9,28 @@ export interface Env {
   RAIL_WEBHOOK_SECRET: string;
   INTERNAL_API_SECRET: string;
   RAIL_TELEGRAM_USERNAME?: string;
+  WEBHOOK_REGISTRATION_ENABLED?: string;
 }
 
 type Bot = "bus" | "rail";
 type TelegramUpdate = { update_id?: number; message?: { chat?: { id?: number; type?: string }; from?: { id?: number }; text?: string } };
 type ClaimedWork = { query_key: string; query: unknown };
+type RailConversation =
+  | { step: "provider" }
+  | { step: "departure"; provider: "srt" | "ktx" }
+  | { step: "arrival"; provider: "srt" | "ktx"; departure: string }
+  | { step: "date"; provider: "srt" | "ktx"; departure: string; arrival: string }
+  | { step: "start_time"; provider: "srt" | "ktx"; departure: string; arrival: string; date: string }
+  | { step: "end_time"; provider: "srt" | "ktx"; departure: string; arrival: string; date: string; start_time: string }
+  | { step: "room"; provider: "ktx"; departure: string; arrival: string; date: string; start_time: string; end_time: string };
+type CompletedRailWatch =
+  | { provider: "srt"; departure: string; arrival: string; date: string; start_time: string; end_time: string }
+  | { provider: "ktx"; departure: string; arrival: string; date: string; start_time: string; end_time: string; room: "general" | "special" | "all" };
 const json = (value: unknown, status = 200) => Response.json(value, { status });
 const now = () => new Date().toISOString();
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (path === "/internal/health" && request.method === "GET") return internal(request, env, () => health(env));
     if (path === "/internal/polls/claim" && request.method === "POST") return internal(request, env, () => claim(request, env));
@@ -26,9 +38,12 @@ export default {
     if (path === "/internal/maintenance" && request.method === "POST") return internal(request, env, () => maintenance(env));
     if (path === "/internal/admin/bootstrap" && request.method === "POST") return internal(request, env, () => bootstrapAdmin(env));
     if (path === "/internal/webhooks/register" && request.method === "POST") return internal(request, env, () => registerWebhooks(request, env));
-    if (path === "/telegram/bus" && request.method === "POST") return telegram(request, env, "bus");
-    if ((path === "/telegram/rail" || path === "/telegram/srt") && request.method === "POST") return telegram(request, env, "rail");
+    if (path === "/telegram/bus" && request.method === "POST") return telegram(request, env, "bus", ctx);
+    if ((path === "/telegram/rail" || path === "/telegram/srt") && request.method === "POST") return telegram(request, env, "rail", ctx);
     return new Response("not found", { status: 404 });
+  },
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(maintenance(env));
   },
 };
 
@@ -37,7 +52,7 @@ async function internal(request: Request, env: Env, handler: () => Promise<Respo
   return handler();
 }
 
-async function telegram(request: Request, env: Env, bot: Bot): Promise<Response> {
+async function telegram(request: Request, env: Env, bot: Bot, ctx?: ExecutionContext): Promise<Response> {
   const secret = bot === "bus" ? env.BUS_WEBHOOK_SECRET : env.RAIL_WEBHOOK_SECRET;
   if (!constantTimeEqual(request.headers.get("X-Telegram-Bot-Api-Secret-Token"), secret)) return new Response("forbidden", { status: 403 });
   let update: TelegramUpdate;
@@ -49,6 +64,7 @@ async function telegram(request: Request, env: Env, bot: Bot): Promise<Response>
   if (!message?.chat?.id || message.chat.type !== "private" || !message.from?.id) return new Response("OK");
   await env.DB.prepare("INSERT OR REPLACE INTO chats(chat_id,telegram_user_id,bot,created_at) VALUES(?,?,?,?)").bind(message.chat.id, message.from.id, bot, now()).run();
   await handleCommand(env, bot, message.from.id, message.chat.id, message.text?.trim() ?? "");
+  ctx?.waitUntil(flushOutbox(env));
   return new Response("OK");
 }
 
@@ -77,12 +93,21 @@ async function handleCommand(env: Env, bot: Bot, userId: number, chatId: number,
   }
   if (command === "/list") return listWatches(env, bot, userId, chatId);
   if (command === "/stop" && arg) {
-    await env.DB.prepare("DELETE FROM watches WHERE id=? AND telegram_user_id=?").bind(arg, userId).run();
-    return send(env, bot, chatId, "Stopped.");
+    const id = await watchIdForStop(env, userId, arg);
+    if (!id) return send(env, bot, chatId, "찾을 수 없는 알림 번호입니다. /list에서 번호를 확인하세요.");
+    await env.DB.prepare("DELETE FROM watches WHERE id=? AND telegram_user_id=?").bind(id, userId).run();
+    return send(env, bot, chatId, "알림을 중지했습니다.");
   }
-  if (command === "/watch") return createWatch(env, bot, userId, chatId, text);
+  if (command === "/reset" && bot === "rail") {
+    await env.DB.prepare("DELETE FROM conversations WHERE telegram_user_id=? AND bot='rail'").bind(userId).run();
+    return send(env, bot, chatId, "입력을 처음부터 다시 받습니다. /start를 보내세요.");
+  }
+  if (command === "/watch") {
+    await createWatch(env, bot, userId, chatId, text);
+    return;
+  }
   if (bot === "rail" && command === "/start") return startRailFlow(env, userId, chatId);
-  if (bot === "rail" && ["srt", "ktx"].includes(text.toLowerCase())) return chooseRailProvider(env, userId, chatId, text.toLowerCase() as "srt" | "ktx");
+  if (bot === "rail" && !text.startsWith("/") && await continueRailFlow(env, userId, chatId, text)) return;
   if (command === "/start") return send(env, bot, chatId, "Use /watch bus. /help has the command format.");
 }
 
@@ -95,21 +120,99 @@ async function useInvite(env: Env, userId: number, chatId: number, bot: Bot, cod
   const used = await env.DB.prepare("UPDATE invites SET used_at=? WHERE code_hash=? AND kind=? AND used_at IS NULL AND expires_at>?").bind(now(), codeHash, kind, now()).run();
   if (!used.meta.changes) return send(env, bot, chatId, "Invalid or expired invite.");
   await env.DB.prepare("INSERT INTO users(telegram_user_id,allowed_at,is_admin) VALUES(?,?,?) ON CONFLICT(telegram_user_id) DO UPDATE SET allowed_at=excluded.allowed_at,is_admin=MAX(users.is_admin,excluded.is_admin)").bind(userId, now(), kind === "admin" ? 1 : 0).run();
+  if (bot === "rail") return startRailFlow(env, userId, chatId, "이용 권한이 생겼습니다.");
   return send(env, bot, chatId, "Access granted.");
 }
 
-async function startRailFlow(env: Env, userId: number, chatId: number): Promise<void> {
+async function startRailFlow(env: Env, userId: number, chatId: number, prefix = ""): Promise<void> {
   await env.DB.prepare("INSERT INTO conversations(telegram_user_id,bot,state_json,expires_at) VALUES(?,?,?,?) ON CONFLICT(telegram_user_id,bot) DO UPDATE SET state_json=excluded.state_json,expires_at=excluded.expires_at")
     .bind(userId, "rail", JSON.stringify({ step: "provider" }), new Date(Date.now() + 30 * 60_000).toISOString()).run();
-  return send(env, "rail", chatId, "Choose SRT or KTX. You can also register directly: /watch srt FROM TO YYYYMMDD HHMM HHMM or /watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all.");
+  return send(env, "rail", chatId, `${prefix ? `${prefix}\n` : ""}SRT 또는 KTX를 입력하세요.`);
 }
 
-async function chooseRailProvider(env: Env, userId: number, chatId: number, provider: "srt" | "ktx"): Promise<void> {
+async function continueRailFlow(env: Env, userId: number, chatId: number, input: string): Promise<boolean> {
   const conversation = await env.DB.prepare("SELECT state_json FROM conversations WHERE telegram_user_id=? AND bot='rail' AND expires_at>?").bind(userId, now()).first<{ state_json: string }>();
-  if (!conversation) return send(env, "rail", chatId, "Use /start first.");
-  await env.DB.prepare("UPDATE conversations SET state_json=?,expires_at=? WHERE telegram_user_id=? AND bot='rail'")
-    .bind(JSON.stringify({ step: "watch_command", provider }), new Date(Date.now() + 30 * 60_000).toISOString(), userId).run();
-  return send(env, "rail", chatId, provider === "srt" ? "Send: /watch srt FROM TO YYYYMMDD HHMM HHMM" : "Send: /watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all");
+  if (!conversation) return false;
+  let state: RailConversation;
+  try { state = JSON.parse(conversation.state_json) as RailConversation; } catch {
+    await startRailFlow(env, userId, chatId);
+    return true;
+  }
+  const next = async (value: RailConversation, prompt: string): Promise<boolean> => {
+    await env.DB.prepare("UPDATE conversations SET state_json=?,expires_at=? WHERE telegram_user_id=? AND bot='rail'")
+      .bind(JSON.stringify(value), new Date(Date.now() + 30 * 60_000).toISOString(), userId).run();
+    await send(env, "rail", chatId, prompt);
+    return true;
+  };
+  const value = input.trim();
+  if (state.step === "provider") {
+    const provider = value.toLowerCase();
+    if (provider !== "srt" && provider !== "ktx") {
+      await send(env, "rail", chatId, "SRT 또는 KTX 중 하나를 입력하세요.");
+      return true;
+    }
+    return next({ step: "departure", provider }, "출발역을 입력하세요. 예: 수서");
+  }
+  if (state.step === "departure") {
+    if (!isSafeToken(value)) {
+      await send(env, "rail", chatId, "출발역 이름을 다시 입력하세요. 예: 수서");
+      return true;
+    }
+    return next({ ...state, step: "arrival", departure: value }, "도착역을 입력하세요. 예: 부산");
+  }
+  if (state.step === "arrival") {
+    if (!isSafeToken(value) || value === state.departure) {
+      await send(env, "rail", chatId, "출발역과 다른 도착역을 입력하세요. 예: 부산");
+      return true;
+    }
+    return next({ ...state, step: "date", arrival: value }, "출발 날짜를 입력하세요. 예: 20260715");
+  }
+  if (state.step === "date") {
+    const date = normalizeDate(value);
+    if (!date || !isValidWatchDate(date)) {
+      await send(env, "rail", chatId, "오늘부터 30일 안의 날짜를 YYYYMMDD 형식으로 입력하세요. 예: 20260715");
+      return true;
+    }
+    return next({ ...state, step: "start_time", date }, "출발 시작 시간을 입력하세요. 예: 0600");
+  }
+  if (state.step === "start_time") {
+    if (!isTime(value)) {
+      await send(env, "rail", chatId, "출발 시작 시간을 HHMM 형식으로 입력하세요. 예: 0600");
+      return true;
+    }
+    return next({ ...state, step: "end_time", start_time: value }, "출발 종료 시간을 입력하세요. 예: 0900");
+  }
+  if (state.step === "end_time") {
+    if (!isTime(value) || value < state.start_time) {
+      await send(env, "rail", chatId, "시작 시간보다 같거나 늦은 HHMM 시각을 입력하세요. 예: 0900");
+      return true;
+    }
+    if (state.provider === "srt") {
+      return finishRailWatch(env, userId, chatId, { provider: "srt", departure: state.departure, arrival: state.arrival, date: state.date, start_time: state.start_time, end_time: value });
+    }
+    return next({ step: "room", provider: "ktx", departure: state.departure, arrival: state.arrival, date: state.date, start_time: state.start_time, end_time: value }, "좌석 종류를 입력하세요. 일반실, 특실, 둘다 중 하나를 입력하면 됩니다.");
+  }
+  const room = roomType(value);
+  if (!room) {
+    await send(env, "rail", chatId, "일반실, 특실, 둘다 중 하나를 입력하세요.");
+    return true;
+  }
+  return finishRailWatch(env, userId, chatId, { provider: "ktx", departure: state.departure, arrival: state.arrival, date: state.date, start_time: state.start_time, end_time: state.end_time, room });
+}
+
+function roomType(value: string): "general" | "special" | "all" | null {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "일반실" || normalized === "일반" || normalized === "general") return "general";
+  if (normalized === "특실" || normalized === "special") return "special";
+  if (normalized === "전체" || normalized === "둘다" || normalized === "all") return "all";
+  return null;
+}
+
+async function finishRailWatch(env: Env, userId: number, chatId: number, state: CompletedRailWatch): Promise<boolean> {
+  const room = state.provider === "ktx" ? ` ${state.room}` : "";
+  const created = await createWatch(env, "rail", userId, chatId, `/watch ${state.provider} ${state.departure} ${state.arrival} ${state.date} ${state.start_time} ${state.end_time}${room}`);
+  if (created) await env.DB.prepare("DELETE FROM conversations WHERE telegram_user_id=? AND bot='rail'").bind(userId).run();
+  return true;
 }
 
 async function createInvite(env: Env, userId: number, chatId: number, kind: "admin" | "user", hours: number): Promise<void> {
@@ -136,6 +239,7 @@ async function bootstrapAdmin(env: Env): Promise<Response> {
 }
 
 async function registerWebhooks(request: Request, env: Env): Promise<Response> {
+  if (env.WEBHOOK_REGISTRATION_ENABLED !== "true") return json({ error: "webhook registration disabled" }, 403);
   const origin = new URL(request.url).origin;
   const registered = await Promise.all([
     setWebhook(env.BUS_TELEGRAM_TOKEN, `${origin}/telegram/bus`, env.BUS_WEBHOOK_SECRET),
@@ -157,21 +261,76 @@ async function setWebhook(token: string, url: string, secret: string): Promise<b
   }
 }
 
-async function createWatch(env: Env, bot: Bot, userId: number, chatId: number, text: string): Promise<void> {
-  if (!(await registrationOpen(env))) return send(env, bot, chatId, "New registrations are temporarily paused.");
+async function createWatch(env: Env, bot: Bot, userId: number, chatId: number, text: string): Promise<boolean> {
+  if (!(await registrationOpen(env))) {
+    await send(env, bot, chatId, "New registrations are temporarily paused.");
+    return false;
+  }
   const parsed = parseWatch(text);
-  if (!parsed) return send(env, bot, chatId, "Bus: /watch bus txbus FROM_CODE TO_CODE YYYYMMDD; KOBUS: /watch bus kobus FROM_CODE FROM_NAME TO_CODE TO_NAME YYYYMMDD. Rail: /watch srt FROM TO YYYYMMDD HHMM HHMM or /watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all.");
-  if ((parsed.provider === "bus") !== (bot === "bus")) return send(env, bot, chatId, "Use the matching bot for this watch.");
-  if (!isValidWatchDate(parsed.query.date)) return send(env, bot, chatId, "Date must be today through 30 days from today.");
+  if (!parsed) {
+    await send(env, bot, chatId, "Bus: /watch bus txbus FROM_CODE TO_CODE YYYYMMDD; KOBUS: /watch bus kobus FROM_CODE FROM_NAME TO_CODE TO_NAME YYYYMMDD. Rail: /watch srt FROM TO YYYYMMDD HHMM HHMM or /watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all.");
+    return false;
+  }
+  if ((parsed.provider === "bus") !== (bot === "bus")) {
+    await send(env, bot, chatId, "Use the matching bot for this watch.");
+    return false;
+  }
+  if (!isValidWatchDate(parsed.query.date)) {
+    await send(env, bot, chatId, "Date must be today through 30 days from today.");
+    return false;
+  }
   const limit = parsed.provider === "bus" ? MAX_BUS_WATCHES : MAX_RAIL_WATCHES;
   const count = await env.DB.prepare(parsed.provider === "bus" ? "SELECT COUNT(*) AS count FROM watches WHERE telegram_user_id=? AND provider='bus'" : "SELECT COUNT(*) AS count FROM watches WHERE telegram_user_id=? AND provider IN ('srt','ktx')").bind(userId).first<{ count: number }>();
-  if ((count?.count ?? 0) >= limit) return send(env, bot, chatId, `Watch limit reached (${limit}).`);
+  if ((count?.count ?? 0) >= limit) {
+    await send(env, bot, chatId, `Watch limit reached (${limit}).`);
+    return false;
+  }
   const queryJson = JSON.stringify(parsed.query);
   const queryKey = await sha256(queryJson);
+  const existing = await env.DB.prepare("SELECT 1 FROM watches WHERE provider=? AND query_key=? AND expires_at>? LIMIT 1").bind(parsed.provider, queryKey, now()).first();
+  if (!existing) {
+    const activeQueries = await env.DB.prepare("SELECT COUNT(DISTINCT query_key) AS count FROM watches WHERE provider=? AND expires_at>?").bind(parsed.provider, now()).first<{ count: number }>();
+    if ((activeQueries?.count ?? 0) >= 10) {
+      await send(env, bot, chatId, "This provider is at its active query limit. Ask an administrator to pause new invites or try an existing route.");
+      return false;
+    }
+  }
   const expiresAt = new Date(`${parsed.query.date.slice(0, 4)}-${parsed.query.date.slice(4, 6)}-${parsed.query.date.slice(6, 8)}T23:59:59.999Z`).toISOString();
   const id = crypto.randomUUID();
   await env.DB.prepare("INSERT INTO watches(id,telegram_user_id,provider,query_key,query_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)").bind(id, userId, parsed.provider, queryKey, queryJson, now(), expiresAt).run();
-  return send(env, bot, chatId, `Watch registered: ${id}`);
+  await send(env, bot, chatId, watchConfirmation(parsed, id));
+  return true;
+}
+
+function watchConfirmation(watch: { provider: Provider; query: Record<string, string> }, id: string): string {
+  const { provider, query } = watch;
+  if (provider === "bus") return `✅ 버스 모니터링 등록!\n📊 5분마다 확인  ID: #${shortWatchId(id)}`;
+  const room = provider === "srt" ? "일반실·특실" : query.room === "general" ? "일반실" : query.room === "special" ? "특실" : "일반실·특실";
+  return `✅ ${provider.toUpperCase()} 모니터링 등록!\n${query.departure} → ${query.arrival}\n📅 ${displayDate(query.date)}  🕐 ${displayTime(query.start_time)}-${displayTime(query.end_time)}  ${room}\n📊 5분마다 확인  ID: #${shortWatchId(id)}`;
+}
+
+function displayDate(value: string): string {
+  const week = ["일", "월", "화", "수", "목", "금", "토"];
+  const date = new Date(Date.UTC(Number(value.slice(0, 4)), Number(value.slice(4, 6)) - 1, Number(value.slice(6, 8))));
+  return `${value.slice(4, 6)}/${value.slice(6, 8)} (${week[date.getUTCDay()]})`;
+}
+
+function displayTime(value: string): string {
+  return `${value.slice(0, 2)}:${value.slice(2, 4)}`;
+}
+
+function shortWatchId(id: string): string {
+  return id.replaceAll("-", "").slice(0, 8).toUpperCase();
+}
+
+async function watchIdForStop(env: Env, userId: number, input: string): Promise<string | null> {
+  const id = input.replace(/^#/, "").toLowerCase();
+  if (/^[a-f0-9]{8}$/.test(id)) {
+    const row = await env.DB.prepare("SELECT id FROM watches WHERE telegram_user_id=? AND lower(replace(id,'-','')) LIKE ? LIMIT 2").bind(userId, `${id}%`).all<{ id: string }>();
+    return row.results.length === 1 ? row.results[0]!.id : null;
+  }
+  const row = await env.DB.prepare("SELECT id FROM watches WHERE id=? AND telegram_user_id=?").bind(input, userId).first<{ id: string }>();
+  return row?.id ?? null;
 }
 
 function parseWatch(text: string): { provider: Provider; query: Record<string, string> } | null {
@@ -271,6 +430,7 @@ async function result(request: Request, env: Env): Promise<Response> {
   const durationMs = Math.max(0, Date.parse(acceptedAt) - Date.parse(run.created_at));
   await env.DB.prepare("UPDATE poll_runs SET status='accepted',accepted_at=?,duration_ms=? WHERE run_id=? AND status='leased'").bind(acceptedAt, durationMs, body.run_id).run();
   await recordSuccessfulRun(env, durationMs);
+  await flushOutbox(env);
   return json({ accepted: true, observation_count: body.observations.length, alert_count: alerts });
 }
 

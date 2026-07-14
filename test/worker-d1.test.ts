@@ -16,6 +16,7 @@ beforeEach(async () => {
     RAIL_WEBHOOK_SECRET: "rail-secret",
     INTERNAL_API_SECRET: "internal-secret",
     RAIL_TELEGRAM_USERNAME: "railbot",
+    WEBHOOK_REGISTRATION_ENABLED: "true",
   };
 });
 
@@ -60,6 +61,35 @@ test("registers both Telegram webhooks through the authenticated internal endpoi
   }
 });
 
+test("staging can disable Telegram webhook registration", async () => {
+  env.WEBHOOK_REGISTRATION_ENABLED = "false";
+  expect((await internalResponse("/internal/webhooks/register", {})).status).toBe(403);
+});
+
+test("Telegram commands flush their reply through the execution context", async () => {
+  const originalFetch = globalThis.fetch;
+  let pending: Promise<unknown> | undefined;
+  const calls: string[] = [];
+  globalThis.fetch = ((input: string | URL | Request) => {
+    calls.push(String(input));
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  }) as typeof fetch;
+  try {
+    const response = await worker.fetch(new Request("https://worker.test/telegram/rail", {
+      method: "POST",
+      headers: { "X-Telegram-Bot-Api-Secret-Token": "rail-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ update_id: 6, message: { chat: { id: 1600, type: "private" }, from: { id: 16 }, text: "/help" } }),
+    }), env, { waitUntil: (promise: Promise<unknown>) => { pending = promise; } } as ExecutionContext);
+    expect(response.status).toBe(200);
+    await pending;
+    expect(calls).toEqual(["https://api.telegram.org/botrail-token/sendMessage"]);
+    const sent = await d1.prepare("SELECT status FROM outbox").first<{ status: string }>();
+    expect(sent?.status).toBe("sent");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("forged and replayed Telegram updates are rejected before command handling", async () => {
   const forged = await worker.fetch(new Request("https://worker.test/telegram/rail", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: "not json",
@@ -72,17 +102,68 @@ test("forged and replayed Telegram updates are rejected before command handling"
   expect(outbox?.count).toBe(1);
 });
 
-test("rail start creates conversation and srt watch registration is real", async () => {
+test("rail start asks for a train type and collects SRT watch fields one at a time", async () => {
   await allowUser(21);
   await railUpdate(10, 21, "/start");
   expect(await conversation(21)).toEqual({ step: "provider" });
-  await railUpdate(11, 21, "srt");
-  expect(await conversation(21)).toEqual({ step: "watch_command", provider: "srt" });
+  expect(await lastOutboxText()).toBe("SRT 또는 KTX를 입력하세요.");
+  await railUpdate(11, 21, "SRT");
+  expect(await conversation(21)).toEqual({ step: "departure", provider: "srt" });
+  expect(await lastOutboxText()).toBe("출발역을 입력하세요. 예: 수서");
+  await railUpdate(12, 21, "수서");
+  expect(await conversation(21)).toEqual({ step: "arrival", provider: "srt", departure: "수서" });
+  expect(await lastOutboxText()).toBe("도착역을 입력하세요. 예: 부산");
+  await railUpdate(13, 21, "부산");
+  expect(await conversation(21)).toEqual({ step: "date", provider: "srt", departure: "수서", arrival: "부산" });
+  expect(await lastOutboxText()).toBe("출발 날짜를 입력하세요. 예: 20260715");
+  await railUpdate(14, 21, "20990101");
+  expect(await conversation(21)).toEqual({ step: "date", provider: "srt", departure: "수서", arrival: "부산" });
+  expect(await lastOutboxText()).toContain("YYYYMMDD");
   const date = watchDate();
-  await railUpdate(12, 21, `/watch srt 수서 부산 ${date} 0600 0900`);
-  const watch = await d1.prepare("SELECT provider,query_json FROM watches WHERE telegram_user_id=?").bind(21).first<{ provider: string; query_json: string }>();
+  await railUpdate(15, 21, date);
+  expect(await conversation(21)).toEqual({ step: "start_time", provider: "srt", departure: "수서", arrival: "부산", date });
+  await railUpdate(16, 21, "0600");
+  expect(await conversation(21)).toEqual({ step: "end_time", provider: "srt", departure: "수서", arrival: "부산", date, start_time: "0600" });
+  await railUpdate(17, 21, "0500");
+  expect(await conversation(21)).toEqual({ step: "end_time", provider: "srt", departure: "수서", arrival: "부산", date, start_time: "0600" });
+  expect(await lastOutboxText()).toContain("같거나 늦은");
+  await railUpdate(18, 21, "0900");
+  const watch = await d1.prepare("SELECT id,provider,query_json FROM watches WHERE telegram_user_id=?").bind(21).first<{ id: string; provider: string; query_json: string }>();
   expect(watch?.provider).toBe("srt");
   expect(JSON.parse(watch!.query_json)).toMatchObject({ departure: "수서", arrival: "부산", date });
+  expect(await lastOutboxText()).toContain("✅ SRT 모니터링 등록!");
+  expect(await lastOutboxText()).toContain("수서 → 부산");
+  expect(await lastOutboxText()).toContain(`#${watch!.id.replaceAll("-", "").slice(0, 8).toUpperCase()}`);
+  expect(await conversation(21)).toBeNull();
+});
+
+test("KTX flow asks for a seat type and summarizes the chosen room", async () => {
+  await allowUser(22);
+  const date = watchDate();
+  for (const [updateId, input] of [[30, "/start"], [31, "ktx"], [32, "서울"], [33, "부산"], [34, date], [35, "1200"], [36, "1800"], [37, "일반실"]] as const) {
+    await railUpdate(updateId, 22, input);
+  }
+  const watch = await d1.prepare("SELECT provider,query_json FROM watches WHERE telegram_user_id=?").bind(22).first<{ provider: string; query_json: string }>();
+  expect(watch?.provider).toBe("ktx");
+  expect(JSON.parse(watch!.query_json)).toMatchObject({ departure: "서울", arrival: "부산", date, room: "general" });
+  expect(await lastOutboxText()).toContain("✅ KTX 모니터링 등록!");
+  expect(await lastOutboxText()).toContain("일반실");
+});
+
+test("a provider accepts subscriptions to existing queries but caps active unique queries at ten", async () => {
+  const date = watchDate();
+  for (let index = 0; index < 10; index++) {
+    await insertWatch(`cap-${index}`, 50 + index, "srt", { departure: `수서${index}`, arrival: "부산", date, start_time: "0600", end_time: "0900" });
+  }
+  await allowUser(70);
+  await railUpdate(70, 70, `/watch srt 수서 부산 ${date} 0600 0900`);
+  expect(await lastOutboxText()).toContain("active query limit");
+
+  const existing = await d1.prepare("SELECT query_json FROM watches WHERE id='cap-0'").first<{ query_json: string }>();
+  const query = JSON.parse(existing!.query_json) as { departure: string; arrival: string; date: string; start_time: string; end_time: string };
+  await railUpdate(71, 70, `/watch srt ${query.departure} ${query.arrival} ${query.date} ${query.start_time} ${query.end_time}`);
+  const count = await d1.prepare("SELECT COUNT(*) AS count FROM watches WHERE telegram_user_id=70").first<{ count: number }>();
+  expect(count?.count).toBe(1);
 });
 
 test("expired leases are reclaimed and active leases block overlap", async () => {

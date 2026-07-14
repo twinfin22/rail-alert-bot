@@ -1,4 +1,4 @@
-name: Register staging Telegram webhooks
+name: Register production Telegram webhooks
 
 "on":
   workflow_dispatch:
@@ -6,7 +6,7 @@ name: Register staging Telegram webhooks
 jobs:
   register:
     runs-on: ubuntu-latest
-    environment: staging
+    environment: production
     steps:
       - run: |
           curl --fail --silent --show-error -X POST "$RAIL_WORKER_URL/internal/webhooks/register" \
