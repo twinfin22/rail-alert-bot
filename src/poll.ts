@@ -10,7 +10,7 @@ const base = required("RAIL_WORKER_URL").replace(/\/$/, "");
 const secret = required("INTERNAL_API_SECRET");
 const provider = process.argv[2] as Provider;
 if (!(["bus", "srt", "ktx"] as string[]).includes(provider)) throw new Error("provider must be bus, srt, or ktx");
-const runId = process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_RUN_ID}-${provider}` : crypto.randomUUID();
+const runId = process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT ?? "1"}-${provider}` : crypto.randomUUID();
 
 async function api(path: string, body?: unknown) {
   const response = await fetch(`${base}${path}`, { method: body ? "POST" : "GET", headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });

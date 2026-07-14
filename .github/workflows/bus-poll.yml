@@ -1,13 +1,22 @@
 name: Bus poll
 "on":
   workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
   schedule:
     - cron: "*/5 * * * *"
-concurrency: { group: rail-alert-bus-poll, cancel-in-progress: false }
+concurrency:
+  group: rail-alert-bus-poll-${{ inputs.environment || 'production' }}
+  cancel-in-progress: false
 jobs:
   poll:
     runs-on: ubuntu-latest
-    environment: staging
+    environment: ${{ inputs.environment || 'production' }}
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
