@@ -13,7 +13,7 @@ name: Maintenance
 jobs:
   maintain:
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment || 'staging' }}
+    environment: ${{ inputs.environment || 'production' }}
     steps:
       - run: |
           curl --fail --silent --show-error -X POST "$RAIL_WORKER_URL/internal/maintenance" \
