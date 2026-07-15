@@ -1,5 +1,5 @@
 import { bearer, constantTimeEqual, sha256 } from "./security";
-import { MAX_BUS_WATCHES, MAX_RAIL_WATCHES, canRegister, isSafeToken, isTime, isValidWatchDate, normalizeDate, shouldNotify, validObservations, type Provider, type QueryObservation } from "./domain";
+import { MAX_BUS_WATCHES, MAX_RAIL_WATCHES, canRegister, isSafeToken, isTime, isValidWatchDate, normalizeDate, shouldNotify, validObservations, type Provider, type QueryObservation, type SeatObservation } from "./domain";
 
 export interface Env {
   DB: D1Database;
@@ -438,15 +438,16 @@ async function applyObservations(env: Env, provider: Provider, observations: Que
   let alerts = 0;
   const timestamp = now();
   for (const observation of observations) {
-    const watches = await env.DB.prepare("SELECT id,telegram_user_id FROM watches WHERE provider=? AND query_key=? AND expires_at>?").bind(provider, observation.query_key, timestamp).all<{ id: string; telegram_user_id: number }>();
+    const watches = await env.DB.prepare("SELECT id,telegram_user_id,query_json FROM watches WHERE provider=? AND query_key=? AND expires_at>?").bind(provider, observation.query_key, timestamp).all<{ id: string; telegram_user_id: number; query_json: string }>();
     for (const watch of watches.results) {
+      const query = alertQuery(watch.query_json);
       for (const seat of observation.seats) {
         const previous = await env.DB.prepare("SELECT available FROM seat_states WHERE watch_id=? AND seat_key=?").bind(watch.id, seat.key).first<{ available: number }>();
         await env.DB.prepare("INSERT INTO seat_states(watch_id,seat_key,available,updated_at) VALUES(?,?,?,?) ON CONFLICT(watch_id,seat_key) DO UPDATE SET available=excluded.available,updated_at=excluded.updated_at").bind(watch.id, seat.key, seat.available ? 1 : 0, timestamp).run();
         if (!shouldNotify(previous?.available === 1 ? true : previous ? false : undefined, seat.available)) continue;
         const chats = await env.DB.prepare("SELECT chat_id,bot FROM chats WHERE telegram_user_id=? AND bot=?").bind(watch.telegram_user_id, provider === "bus" ? "bus" : "rail").all<{ chat_id: number; bot: Bot }>();
         for (const chat of chats.results) {
-          await send(env, chat.bot, chat.chat_id, `Availability found (${watch.id}): ${seat.label}`);
+          await send(env, chat.bot, chat.chat_id, availabilityAlert(provider, query, seat));
           alerts++;
         }
       }
@@ -454,6 +455,38 @@ async function applyObservations(env: Env, provider: Provider, observations: Que
     }
   }
   return alerts;
+}
+
+function alertQuery(value: string): Record<string, string> {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed as Record<string, string> : {};
+  } catch {
+    return {};
+  }
+}
+
+function availabilityAlert(provider: Provider, query: Record<string, string>, seat: SeatObservation): string {
+  if (provider === "srt" || provider === "ktx") return railAvailabilityAlert(provider, query, seat);
+  return busAvailabilityAlert(query, seat);
+}
+
+function railAvailabilityAlert(provider: "srt" | "ktx", query: Record<string, string>, seat: SeatObservation): string {
+  const [, trainNo, date, departureTime, room] = seat.key.split("|");
+  if (!trainNo || !/^\d{8}$/.test(date ?? "") || !/^\d{4,6}$/.test(departureTime ?? "") || !room) return `🎟 빈자리 발견!\n${seat.label}`;
+  const roomName = room === "general" ? "일반실" : room === "special" ? "특실" : room;
+  const route = query.departure && query.arrival ? `${query.departure} → ${query.arrival}` : "등록한 노선";
+  const watchDate = query.date && /^\d{8}$/.test(query.date) ? query.date : date;
+  return `🎟 빈자리 발견!\n${provider.toUpperCase()} ${route}\n📅 ${displayDate(watchDate)}  🕐 ${displayTime(departureTime)} 출발 · ${trainNo}호 · ${roomName}\n좌석은 실시간으로 바뀔 수 있어요.`;
+}
+
+function busAvailabilityAlert(query: Record<string, string>, seat: SeatObservation): string {
+  const [departureTime, grade] = seat.key.split("|");
+  const departure = query.departure_name ?? query.departure_code ?? "출발지";
+  const arrival = query.arrival_name ?? query.arrival_code ?? "도착지";
+  const time = /^\d{4}$/.test(departureTime ?? "") ? displayTime(departureTime!) : departureTime || "출발 시각";
+  const seats = seat.label.match(/\((\d+) seats\)/)?.[1];
+  return `🎟 빈자리 발견!\n버스 ${departure} → ${arrival}\n📅 ${query.date && /^\d{8}$/.test(query.date) ? displayDate(query.date) : "출발일"}  🕐 ${time} 출발 · ${grade || "좌석"}\n${seats ? `잔여 ${seats}석` : "좌석이 확인됐어요."}`;
 }
 
 async function maintenance(env: Env): Promise<Response> {
