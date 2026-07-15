@@ -220,6 +220,7 @@ test("state transitions enqueue only unavailable to available alerts", async () 
 
   await submitObservation("state-1", queryKey, true);
   expect(await alertCount()).toBe(1);
+  expect(await lastOutboxText()).toBe(`🎟 빈자리 발견!\nSRT 수서 → 부산\n📅 ${displayDateForTest(query.date)}  🕐 06:00 출발 · 1호 · 일반실\n좌석은 실시간으로 바뀔 수 있어요.`);
   await submitObservation("state-2", queryKey, true);
   expect(await alertCount()).toBe(1);
   await submitObservation("state-3", queryKey, false);
@@ -306,8 +307,14 @@ async function lastOutboxText(): Promise<string | undefined> {
 }
 
 async function alertCount(): Promise<number> {
-  const row = await d1.prepare("SELECT COUNT(*) AS count FROM outbox WHERE body_json LIKE '%Availability found%'").first<{ count: number }>();
+  const row = await d1.prepare("SELECT COUNT(*) AS count FROM outbox WHERE body_json LIKE '%빈자리 발견%'").first<{ count: number }>();
   return row?.count ?? 0;
+}
+
+function displayDateForTest(value: string): string {
+  const week = ["일", "월", "화", "수", "목", "금", "토"];
+  const date = new Date(Date.UTC(Number(value.slice(0, 4)), Number(value.slice(4, 6)) - 1, Number(value.slice(6, 8))));
+  return `${value.slice(4, 6)}/${value.slice(6, 8)} (${week[date.getUTCDay()]})`;
 }
 
 function now(): string { return new Date().toISOString(); }
