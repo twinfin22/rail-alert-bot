@@ -73,9 +73,9 @@ async function handleCommand(env: Env, bot: Bot, userId: number, chatId: number,
   if (command === "/start" && arg?.startsWith("admin_")) return useInvite(env, userId, chatId, bot, arg.slice(6), "admin");
   if (command === "/start" && arg?.startsWith("invite_")) return useInvite(env, userId, chatId, bot, arg.slice(7), "user");
   const user = await env.DB.prepare("SELECT is_admin FROM users WHERE telegram_user_id=?").bind(userId).first<{ is_admin: number }>();
-  if (command === "/help") return send(env, bot, chatId, "5-minute polling is best effort; GitHub schedules can be delayed or missed. /watch /list /stop /delete");
-  if (!user) return send(env, bot, chatId, "Access required.");
-  if (command === "/status" && user.is_admin && bot === "rail") return send(env, bot, chatId, JSON.stringify(await status(env)));
+  if (command === "/help") return send(env, bot, chatId, helpText(bot));
+  if (!user) return send(env, bot, chatId, "이용 권한이 없어요. 초대 링크로 먼저 참여해 주세요.");
+  if (command === "/status" && user.is_admin && bot === "rail") return send(env, bot, chatId, await userStatusMessage(env));
   if (command === "/users" && user.is_admin && bot === "rail") return listUsers(env, bot, chatId);
   if (command === "/invite" && user.is_admin && bot === "rail") return createInvite(env, userId, chatId, "user", 24);
   if (command === "/revoke" && user.is_admin && bot === "rail" && arg) return revoke(env, bot, chatId, arg);
@@ -89,7 +89,7 @@ async function handleCommand(env: Env, bot: Bot, userId: number, chatId: number,
       env.DB.prepare("DELETE FROM chats WHERE telegram_user_id=?").bind(userId),
       env.DB.prepare("DELETE FROM users WHERE telegram_user_id=?").bind(userId),
     ]);
-    return send(env, bot, chatId, "Your watches and access were deleted.");
+    return send(env, bot, chatId, "등록한 알림과 이용 권한을 삭제했어요.");
   }
   if (command === "/list") return listWatches(env, bot, userId, chatId);
   if (command === "/stop" && arg) {
@@ -108,26 +108,26 @@ async function handleCommand(env: Env, bot: Bot, userId: number, chatId: number,
   }
   if (bot === "rail" && command === "/start") return startRailFlow(env, userId, chatId);
   if (bot === "rail" && !text.startsWith("/") && await continueRailFlow(env, userId, chatId, text)) return;
-  if (command === "/start") return send(env, bot, chatId, "Use /watch bus. /help has the command format.");
+  if (command === "/start") return send(env, bot, chatId, "🚌 버스 알림은 노선 정보를 입력해 등록할 수 있어요.\n/help에서 입력 방법을 확인해 주세요.");
 }
 
 async function useInvite(env: Env, userId: number, chatId: number, bot: Bot, code: string, kind: "admin" | "user"): Promise<void> {
   if (kind === "admin") {
     const admin = await env.DB.prepare("SELECT telegram_user_id FROM users WHERE is_admin=1 LIMIT 1").first();
-    if (admin) return send(env, bot, chatId, "Administrator already configured.");
+    if (admin) return send(env, bot, chatId, "이미 관리자가 설정되어 있어요.");
   }
   const codeHash = await sha256(code);
   const used = await env.DB.prepare("UPDATE invites SET used_at=? WHERE code_hash=? AND kind=? AND used_at IS NULL AND expires_at>?").bind(now(), codeHash, kind, now()).run();
-  if (!used.meta.changes) return send(env, bot, chatId, "Invalid or expired invite.");
+  if (!used.meta.changes) return send(env, bot, chatId, "초대 링크가 만료됐거나 이미 사용됐어요.");
   await env.DB.prepare("INSERT INTO users(telegram_user_id,allowed_at,is_admin) VALUES(?,?,?) ON CONFLICT(telegram_user_id) DO UPDATE SET allowed_at=excluded.allowed_at,is_admin=MAX(users.is_admin,excluded.is_admin)").bind(userId, now(), kind === "admin" ? 1 : 0).run();
   if (bot === "rail") return startRailFlow(env, userId, chatId, "이용 권한이 생겼습니다.");
-  return send(env, bot, chatId, "Access granted.");
+  return send(env, bot, chatId, "이용 권한이 생겼어요. /help에서 알림 등록 방법을 확인해 주세요.");
 }
 
 async function startRailFlow(env: Env, userId: number, chatId: number, prefix = ""): Promise<void> {
   await env.DB.prepare("INSERT INTO conversations(telegram_user_id,bot,state_json,expires_at) VALUES(?,?,?,?) ON CONFLICT(telegram_user_id,bot) DO UPDATE SET state_json=excluded.state_json,expires_at=excluded.expires_at")
     .bind(userId, "rail", JSON.stringify({ step: "provider" }), new Date(Date.now() + 30 * 60_000).toISOString()).run();
-  return send(env, "rail", chatId, `${prefix ? `${prefix}\n` : ""}SRT 또는 KTX를 입력하세요.`);
+  return send(env, "rail", chatId, `${prefix ? `${prefix}\n` : ""}🚆 어떤 열차를 확인할까요?\nSRT 또는 KTX를 입력하세요.`);
 }
 
 async function continueRailFlow(env: Env, userId: number, chatId: number, input: string): Promise<boolean> {
@@ -217,7 +217,7 @@ async function finishRailWatch(env: Env, userId: number, chatId: number, state: 
 
 async function createInvite(env: Env, userId: number, chatId: number, kind: "admin" | "user", hours: number): Promise<void> {
   const link = await issueInvite(env, kind, hours, userId);
-  if (!link) return send(env, "rail", chatId, "RAIL_TELEGRAM_USERNAME is not configured.");
+  if (!link) return send(env, "rail", chatId, "초대 링크를 만들지 못했어요. 봇 설정을 확인해 주세요.");
   return send(env, "rail", chatId, link);
 }
 
@@ -263,26 +263,28 @@ async function setWebhook(token: string, url: string, secret: string): Promise<b
 
 async function createWatch(env: Env, bot: Bot, userId: number, chatId: number, text: string): Promise<boolean> {
   if (!(await registrationOpen(env))) {
-    await send(env, bot, chatId, "New registrations are temporarily paused.");
+    await send(env, bot, chatId, "지금은 새 알림 등록을 잠시 쉬고 있어요. 잠시 후 다시 시도해 주세요.");
     return false;
   }
   const parsed = parseWatch(text);
   if (!parsed) {
-    await send(env, bot, chatId, "Bus: /watch bus txbus FROM_CODE TO_CODE YYYYMMDD; KOBUS: /watch bus kobus FROM_CODE FROM_NAME TO_CODE TO_NAME YYYYMMDD. Rail: /watch srt FROM TO YYYYMMDD HHMM HHMM or /watch ktx FROM TO YYYYMMDD HHMM HHMM general|special|all.");
+    await send(env, bot, chatId, bot === "rail"
+      ? "입력 형식이 맞지 않아요.\n/start를 보내면 순서대로 쉽게 등록할 수 있어요."
+      : "입력 형식이 맞지 않아요.\n시외버스: /watch bus txbus 출발터미널코드 도착터미널코드 YYYYMMDD\n고속버스: /watch bus kobus 출발코드 출발지 도착코드 도착지 YYYYMMDD");
     return false;
   }
   if ((parsed.provider === "bus") !== (bot === "bus")) {
-    await send(env, bot, chatId, "Use the matching bot for this watch.");
+    await send(env, bot, chatId, "이 알림은 다른 봇에서 등록해 주세요.");
     return false;
   }
   if (!isValidWatchDate(parsed.query.date)) {
-    await send(env, bot, chatId, "Date must be today through 30 days from today.");
+    await send(env, bot, chatId, "출발일은 오늘부터 30일 안에서 선택해 주세요.");
     return false;
   }
   const limit = parsed.provider === "bus" ? MAX_BUS_WATCHES : MAX_RAIL_WATCHES;
   const count = await env.DB.prepare(parsed.provider === "bus" ? "SELECT COUNT(*) AS count FROM watches WHERE telegram_user_id=? AND provider='bus'" : "SELECT COUNT(*) AS count FROM watches WHERE telegram_user_id=? AND provider IN ('srt','ktx')").bind(userId).first<{ count: number }>();
   if ((count?.count ?? 0) >= limit) {
-    await send(env, bot, chatId, `Watch limit reached (${limit}).`);
+    await send(env, bot, chatId, `등록할 수 있는 알림은 최대 ${limit}개예요. /list에서 기존 알림을 확인해 주세요.`);
     return false;
   }
   const queryJson = JSON.stringify(parsed.query);
@@ -291,7 +293,7 @@ async function createWatch(env: Env, bot: Bot, userId: number, chatId: number, t
   if (!existing) {
     const activeQueries = await env.DB.prepare("SELECT COUNT(DISTINCT query_key) AS count FROM watches WHERE provider=? AND expires_at>?").bind(parsed.provider, now()).first<{ count: number }>();
     if ((activeQueries?.count ?? 0) >= 10) {
-      await send(env, bot, chatId, "This provider is at its active query limit. Ask an administrator to pause new invites or try an existing route.");
+      await send(env, bot, chatId, "지금은 이 교통수단의 확인 요청이 많아요. 잠시 후 다시 시도해 주세요.");
       return false;
     }
   }
@@ -304,9 +306,9 @@ async function createWatch(env: Env, bot: Bot, userId: number, chatId: number, t
 
 function watchConfirmation(watch: { provider: Provider; query: Record<string, string> }, id: string): string {
   const { provider, query } = watch;
-  if (provider === "bus") return `✅ 버스 모니터링 등록!\n📊 5분마다 확인  ID: #${shortWatchId(id)}`;
+  if (provider === "bus") return `✅ 버스 알림을 등록했어요!\n📊 5분마다 확인해요.\n중지: /stop #${shortWatchId(id)}`;
   const room = provider === "srt" ? "일반실·특실" : query.room === "general" ? "일반실" : query.room === "special" ? "특실" : "일반실·특실";
-  return `✅ ${provider.toUpperCase()} 모니터링 등록!\n${query.departure} → ${query.arrival}\n📅 ${displayDate(query.date)}  🕐 ${displayTime(query.start_time)}-${displayTime(query.end_time)}  ${room}\n📊 5분마다 확인  ID: #${shortWatchId(id)}`;
+  return `✅ ${provider.toUpperCase()} 알림을 등록했어요!\n${query.departure} → ${query.arrival}\n📅 ${displayDate(query.date)}  🕐 ${displayTime(query.start_time)}–${displayTime(query.end_time)} · ${room}\n📊 5분마다 확인해요.\n중지: /stop #${shortWatchId(id)}`;
 }
 
 function displayDate(value: string): string {
@@ -321,6 +323,27 @@ function displayTime(value: string): string {
 
 function shortWatchId(id: string): string {
   return id.replaceAll("-", "").slice(0, 8).toUpperCase();
+}
+
+function helpText(bot: Bot): string {
+  if (bot === "rail") return "🚆 열차 알림 도움말\n/start · SRT 또는 KTX 알림 등록\n/list · 등록한 알림 보기\n/stop #번호 · 알림 중지\n/reset · 등록을 처음부터 다시 하기";
+  return "🚌 버스 알림 도움말\n/watch bus txbus 출발터미널코드 도착터미널코드 YYYYMMDD\n/list · 등록한 알림 보기\n/stop #번호 · 알림 중지";
+}
+
+function watchListItem(watch: { id: string; provider: string; query_json: string }): string {
+  const query = alertQuery(watch.query_json);
+  const stop = `중지: /stop #${shortWatchId(watch.id)}`;
+  if (watch.provider === "srt" || watch.provider === "ktx") {
+    const room = watch.provider === "srt" ? "일반실·특실" : query.room === "general" ? "일반실" : query.room === "special" ? "특실" : "일반실·특실";
+    const route = query.departure && query.arrival ? `${query.departure} → ${query.arrival}` : "등록한 노선";
+    const date = query.date && /^\d{8}$/.test(query.date) ? displayDate(query.date) : "출발일";
+    const time = query.start_time && query.end_time ? `${displayTime(query.start_time)}–${displayTime(query.end_time)}` : "출발 시간";
+    return `${watch.provider.toUpperCase()} ${route}\n📅 ${date} · 🕐 ${time} · ${room}\n${stop}`;
+  }
+  const departure = query.departure_name ?? query.departure_code ?? "출발지";
+  const arrival = query.arrival_name ?? query.arrival_code ?? "도착지";
+  const date = query.date && /^\d{8}$/.test(query.date) ? displayDate(query.date) : "출발일";
+  return `버스 ${departure} → ${arrival}\n📅 ${date}\n${stop}`;
 }
 
 async function watchIdForStop(env: Env, userId: number, input: string): Promise<string | null> {
@@ -363,25 +386,36 @@ function parseWatch(text: string): { provider: Provider; query: Record<string, s
 
 async function listWatches(env: Env, bot: Bot, userId: number, chatId: number): Promise<void> {
   const watches = await env.DB.prepare("SELECT id,provider,query_json FROM watches WHERE telegram_user_id=? ORDER BY created_at").bind(userId).all<{ id: string; provider: string; query_json: string }>();
-  const text = watches.results.length ? watches.results.map((watch) => `${watch.id} ${watch.provider} ${watch.query_json}`).join("\n") : "No watches.";
+  const text = watches.results.length
+    ? `📋 내 알림\n\n${watches.results.map(watchListItem).join("\n\n")}`
+    : "📋 등록된 알림이 없어요.\n/start를 보내 새 알림을 등록해 보세요.";
   return send(env, bot, chatId, text);
 }
 
 async function revoke(env: Env, bot: Bot, chatId: number, rawUserId: string): Promise<void> {
-  if (!/^\d+$/.test(rawUserId)) return send(env, bot, chatId, "Usage: /revoke TELEGRAM_USER_ID");
+  if (!/^\d+$/.test(rawUserId)) return send(env, bot, chatId, "사용자 번호를 입력해 주세요. 예: /revoke 123456789");
   const userId = Number(rawUserId);
   await env.DB.batch([env.DB.prepare("DELETE FROM watches WHERE telegram_user_id=?").bind(userId), env.DB.prepare("DELETE FROM chats WHERE telegram_user_id=?").bind(userId), env.DB.prepare("DELETE FROM users WHERE telegram_user_id=? AND is_admin=0").bind(userId)]);
-  return send(env, bot, chatId, "Access revoked.");
+  return send(env, bot, chatId, "해당 사용자의 이용 권한과 알림을 삭제했어요.");
 }
 
 async function listUsers(env: Env, bot: Bot, chatId: number): Promise<void> {
   const users = await env.DB.prepare("SELECT telegram_user_id,is_admin FROM users ORDER BY allowed_at").all<{ telegram_user_id: number; is_admin: number }>();
-  return send(env, bot, chatId, users.results.length ? users.results.map((user) => `${user.telegram_user_id}${user.is_admin ? " admin" : ""}`).join("\n") : "No users.");
+  return send(env, bot, chatId, users.results.length ? `👥 이용자 목록\n${users.results.map((user) => `• ${user.telegram_user_id}${user.is_admin ? " · 관리자" : ""}`).join("\n")}` : "등록된 이용자가 없어요.");
+}
+
+async function userStatusMessage(env: Env): Promise<string> {
+  const [open, pending, dead] = await Promise.all([
+    registrationOpen(env),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM outbox WHERE status='pending'").first<{ count: number }>(),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM outbox WHERE status='dead-letter'").first<{ count: number }>(),
+  ]);
+  return `📊 운영 상태\n새 알림 등록: ${open ? "가능" : "일시 중지"}\n전송 대기 메시지: ${pending?.count ?? 0}건\n확인이 필요한 전송 실패: ${dead?.count ?? 0}건`;
 }
 
 async function setRegistration(env: Env, bot: Bot, chatId: number, open: boolean): Promise<void> {
   await env.DB.prepare("INSERT INTO settings(key,value,updated_at) VALUES('registration_paused',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(open ? "0" : "1", now()).run();
-  return send(env, bot, chatId, open ? "Registrations resumed." : "Registrations paused.");
+  return send(env, bot, chatId, open ? "새 알림 등록을 다시 받습니다." : "새 알림 등록을 잠시 멈췄습니다.");
 }
 
 async function registrationPaused(env: Env): Promise<boolean> {
