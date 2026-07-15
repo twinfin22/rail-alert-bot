@@ -11,12 +11,12 @@ name: KTX poll
   schedule:
     - cron: "*/5 * * * *"
 concurrency:
-  group: rail-alert-ktx-poll-${{ inputs.environment || 'staging' }}
+  group: rail-alert-ktx-poll-${{ inputs.environment || 'production' }}
   cancel-in-progress: false
 jobs:
   poll:
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment || 'staging' }}
+    environment: ${{ inputs.environment || 'production' }}
     timeout-minutes: 4
     steps:
       - uses: actions/checkout@v4
