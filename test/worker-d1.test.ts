@@ -25,7 +25,7 @@ test("invites grant access once and reject reuse or expiry", async () => {
   await railUpdate(1, 11, "/start invite_good");
   expect(await user(11)).toEqual({ telegram_user_id: 11, is_admin: 0 });
   await railUpdate(2, 12, "/start invite_good");
-  expect(await lastOutboxText()).toBe("Invalid or expired invite.");
+  expect(await lastOutboxText()).toBe("초대 링크가 만료됐거나 이미 사용됐어요.");
 
   await insertInvite("old", "user", past());
   await railUpdate(3, 13, "/start invite_old");
@@ -106,7 +106,7 @@ test("rail start asks for a train type and collects SRT watch fields one at a ti
   await allowUser(21);
   await railUpdate(10, 21, "/start");
   expect(await conversation(21)).toEqual({ step: "provider" });
-  expect(await lastOutboxText()).toBe("SRT 또는 KTX를 입력하세요.");
+  expect(await lastOutboxText()).toBe("🚆 어떤 열차를 확인할까요?\nSRT 또는 KTX를 입력하세요.");
   await railUpdate(11, 21, "SRT");
   expect(await conversation(21)).toEqual({ step: "departure", provider: "srt" });
   expect(await lastOutboxText()).toBe("출발역을 입력하세요. 예: 수서");
@@ -131,7 +131,7 @@ test("rail start asks for a train type and collects SRT watch fields one at a ti
   const watch = await d1.prepare("SELECT id,provider,query_json FROM watches WHERE telegram_user_id=?").bind(21).first<{ id: string; provider: string; query_json: string }>();
   expect(watch?.provider).toBe("srt");
   expect(JSON.parse(watch!.query_json)).toMatchObject({ departure: "수서", arrival: "부산", date });
-  expect(await lastOutboxText()).toContain("✅ SRT 모니터링 등록!");
+  expect(await lastOutboxText()).toContain("✅ SRT 알림을 등록했어요!");
   expect(await lastOutboxText()).toContain("수서 → 부산");
   expect(await lastOutboxText()).toContain(`#${watch!.id.replaceAll("-", "").slice(0, 8).toUpperCase()}`);
   expect(await conversation(21)).toBeNull();
@@ -146,8 +146,26 @@ test("KTX flow asks for a seat type and summarizes the chosen room", async () =>
   const watch = await d1.prepare("SELECT provider,query_json FROM watches WHERE telegram_user_id=?").bind(22).first<{ provider: string; query_json: string }>();
   expect(watch?.provider).toBe("ktx");
   expect(JSON.parse(watch!.query_json)).toMatchObject({ departure: "서울", arrival: "부산", date, room: "general" });
-  expect(await lastOutboxText()).toContain("✅ KTX 모니터링 등록!");
+  expect(await lastOutboxText()).toContain("✅ KTX 알림을 등록했어요!");
   expect(await lastOutboxText()).toContain("일반실");
+});
+
+test("lists watches as readable trips without internal JSON", async () => {
+  await allowUser(23);
+  await d1.prepare("INSERT INTO chats(chat_id,telegram_user_id,bot,created_at) VALUES(?,?,?,?)").bind(2300, 23, "rail", now()).run();
+  await insertWatch("list-srt", 23, "srt", { departure: "동대구", arrival: "수서", date: watchDate(), start_time: "1300", end_time: "1700" });
+  await insertWatch("list-ktx", 23, "ktx", { departure: "서울", arrival: "순천", date: watchDate(), start_time: "1300", end_time: "1500", room: "all" });
+
+  await railUpdate(40, 23, "/list");
+
+  const text = await lastOutboxText();
+  expect(text).toContain("📋 내 알림");
+  expect(text).toContain("SRT 동대구 → 수서");
+  expect(text).toContain("KTX 서울 → 순천");
+  expect(text).toContain("13:00–17:00");
+  expect(text).toContain("/stop #LISTSRT");
+  expect(text).not.toContain("{");
+  expect(text).not.toContain("list-srt");
 });
 
 test("a provider accepts subscriptions to existing queries but caps active unique queries at ten", async () => {
@@ -157,7 +175,7 @@ test("a provider accepts subscriptions to existing queries but caps active uniqu
   }
   await allowUser(70);
   await railUpdate(70, 70, `/watch srt 수서 부산 ${date} 0600 0900`);
-  expect(await lastOutboxText()).toContain("active query limit");
+  expect(await lastOutboxText()).toContain("확인 요청이 많아요");
 
   const existing = await d1.prepare("SELECT query_json FROM watches WHERE id='cap-0'").first<{ query_json: string }>();
   const query = JSON.parse(existing!.query_json) as { departure: string; arrival: string; date: string; start_time: string; end_time: string };
@@ -200,7 +218,7 @@ test("two expired leases pause registration until two fast successful runs recov
     await internal("/internal/maintenance", {});
   }
   await railUpdate(22, 33, `/watch srt 수서 부산 ${watchDate()} 0600 0900`);
-  expect(await lastOutboxText()).toBe("New registrations are temporarily paused.");
+  expect(await lastOutboxText()).toBe("지금은 새 알림 등록을 잠시 쉬고 있어요. 잠시 후 다시 시도해 주세요.");
 
   for (const runId of ["fast-1", "fast-2"]) {
     const claim = await internal("/internal/polls/claim", { provider: "srt", run_id: runId });
