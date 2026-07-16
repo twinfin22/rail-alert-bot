@@ -202,12 +202,42 @@ test("expired, duplicate, and stale results are rejected", async () => {
   const claim = await internal("/internal/polls/claim", { provider: "srt", run_id: "result-1" });
   const payload = { provider: "srt", run_id: "result-1", lease_token: claim.lease_token, observations: [{ query_key: queryKey, seats: [] }] };
   expect((await internal("/internal/polls/result", payload)).accepted).toBe(true);
-  expect((await internal("/internal/polls/result", payload)).accepted).toBe(false);
+  expect((await internal("/internal/polls/result", payload)).idempotent).toBe(true);
 
   const second = await internal("/internal/polls/claim", { provider: "srt", run_id: "result-2" });
   await d1.prepare("UPDATE poll_runs SET leased_until=? WHERE run_id='result-2'").bind(past()).run();
   const stale = await internal("/internal/polls/result", { ...payload, run_id: "result-2", lease_token: second.lease_token });
   expect(stale.accepted).toBe(false);
+});
+
+test("Railway slots dedupe a provider, record terminal status, and let only attempt two retry a failure", async () => {
+  const queryKey = await insertWatch("slot-watch", 320, "srt", { departure: "수서", arrival: "부산", date: watchDate(), start_time: "0600", end_time: "0900" });
+  const scheduledFor = new Date(Math.floor(Date.now() / 300_000) * 300_000).toISOString();
+  const first = await internal("/internal/polls/claim", { provider: "srt", run_id: "slot-1", scheduled_for: scheduledFor, source: "railway", attempt: 1 });
+  expect(first.claimed).toBe(true);
+  expect((await internal("/internal/polls/claim", { provider: "srt", run_id: "slot-duplicate", scheduled_for: scheduledFor, source: "railway", attempt: 1 })).reason).toBe("already_leased");
+  expect((await internal("/internal/polls/fail", { provider: "srt", run_id: "slot-1", lease_token: "wrong" })).failed).toBe(false);
+  expect((await internal("/internal/polls/fail", { provider: "srt", run_id: "slot-1", lease_token: first.lease_token, reason: "timeout" })).failed).toBe(true);
+  const retry = await internal("/internal/polls/claim", { provider: "srt", run_id: "slot-2", scheduled_for: scheduledFor, source: "railway", attempt: 2 });
+  expect(retry.claimed).toBe(true);
+  expect((await internal("/internal/polls/result", { provider: "srt", run_id: "slot-2", lease_token: retry.lease_token, observations: [{ query_key: queryKey, seats: [] }] })).accepted).toBe(true);
+  expect(await d1.prepare("SELECT status,attempt FROM poll_slots WHERE provider='srt' AND scheduled_for=?").bind(scheduledFor).first<{ status: string; attempt: number }>()).toEqual({ status: "accepted", attempt: 2 });
+});
+
+test("a Railway no-work slot is recorded and duplicate result submissions create one deterministic alert", async () => {
+  const scheduledFor = new Date(Math.floor(Date.now() / 300_000) * 300_000).toISOString();
+  expect((await internal("/internal/polls/claim", { provider: "ktx", run_id: "no-work", scheduled_for: scheduledFor, source: "railway", attempt: 1 })).reason).toBe("no_work");
+  expect(await d1.prepare("SELECT status FROM poll_slots WHERE provider='ktx' AND scheduled_for=?").bind(scheduledFor).first<{ status: string }>()).toEqual({ status: "no_work" });
+
+  await allowUser(321);
+  await d1.prepare("INSERT INTO chats(chat_id,telegram_user_id,bot,created_at) VALUES(?,?,?,?)").bind(32100, 321, "rail", now()).run();
+  const queryKey = await insertWatch("idempotent-watch", 321, "srt", { departure: "수서", arrival: "부산", date: watchDate(), start_time: "0600", end_time: "0900" });
+  const claim = await internal("/internal/polls/claim", { provider: "srt", run_id: "same-result" });
+  const payload = { provider: "srt", run_id: "same-result", lease_token: claim.lease_token, observations: [{ query_key: queryKey, seats: [{ key: "srt|2|20990101|070000|general", available: true, label: "SRT 2" }] }] };
+  const outcomes = await Promise.all([internal("/internal/polls/result", payload), internal("/internal/polls/result", payload)]);
+  expect(outcomes.filter((outcome) => outcome.accepted).length).toBe(2);
+  expect(await d1.prepare("SELECT COUNT(*) AS count FROM outbox WHERE body_json LIKE '%빈자리 발견%'").first<{ count: number }>()).toEqual({ count: 1 });
+  expect(await d1.prepare("SELECT result_hash FROM poll_runs WHERE run_id='same-result'").first<{ result_hash: string }>()).toMatchObject({ result_hash: expect.stringMatching(/^[a-f0-9]{64}$/) });
 });
 
 test("two expired leases pause registration until two fast successful runs recover it", async () => {
@@ -227,7 +257,7 @@ test("two expired leases pause registration until two fast successful runs recov
   }
   await railUpdate(23, 33, `/watch srt 수서 부산 ${watchDate()} 0600 0900`);
   const watches = await d1.prepare("SELECT COUNT(*) AS count FROM watches WHERE telegram_user_id=33").first<{ count: number }>();
-  expect(watches?.count).toBe(2);
+  expect(watches?.count).toBe(1);
 });
 
 test("state transitions enqueue only unavailable to available alerts", async () => {

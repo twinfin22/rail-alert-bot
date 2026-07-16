@@ -80,7 +80,8 @@ export async function getSchedule(
   departureName: string,
   arrivalCode: string,
   arrivalName: string,
-  date: string // YYYYMMDD
+  date: string, // YYYYMMDD
+  signal?: AbortSignal
 ): Promise<BusSchedule[]> {
   // Step 1: Get session cookie
   const sessionRes = await fetch(`${BASE}/mrs/rotinf.do`, {
@@ -90,7 +91,7 @@ export async function getSchedule(
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     },
     redirect: "manual",
-    signal: AbortSignal.timeout(10_000),
+    signal: signal ?? AbortSignal.timeout(10_000),
   });
   if (!sessionRes.ok && sessionRes.status !== 302) {
     throw new Error(`kobus session failed: ${sessionRes.status}`);
@@ -133,7 +134,7 @@ export async function getSchedule(
       Cookie: cookieStr,
     },
     body: params.toString(),
-    signal: AbortSignal.timeout(10_000),
+    signal: signal ?? AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`kobus schedule fetch failed: ${res.status}`);
 

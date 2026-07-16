@@ -35,6 +35,7 @@ export default {
     if (path === "/internal/health" && request.method === "GET") return internal(request, env, () => health(env));
     if (path === "/internal/polls/claim" && request.method === "POST") return internal(request, env, () => claim(request, env));
     if (path === "/internal/polls/result" && request.method === "POST") return internal(request, env, () => result(request, env));
+    if (path === "/internal/polls/fail" && request.method === "POST") return internal(request, env, () => fail(request, env));
     if (path === "/internal/maintenance" && request.method === "POST") return internal(request, env, () => maintenance(env));
     if (path === "/internal/admin/bootstrap" && request.method === "POST") return internal(request, env, () => bootstrapAdmin(env));
     if (path === "/internal/webhooks/register" && request.method === "POST") return internal(request, env, () => registerWebhooks(request, env));
@@ -298,17 +299,27 @@ async function createWatch(env: Env, bot: Bot, userId: number, chatId: number, t
     }
   }
   const expiresAt = new Date(`${parsed.query.date.slice(0, 4)}-${parsed.query.date.slice(4, 6)}-${parsed.query.date.slice(6, 8)}T23:59:59.999Z`).toISOString();
+  const duplicate = await env.DB.prepare("SELECT 1 FROM watches WHERE telegram_user_id=? AND provider=? AND query_key=? LIMIT 1").bind(userId, parsed.provider, queryKey).first();
+  if (duplicate) {
+    await send(env, bot, chatId, "같은 알림이 이미 등록되어 있어요. /list에서 확인해 주세요.");
+    return false;
+  }
   const id = crypto.randomUUID();
-  await env.DB.prepare("INSERT INTO watches(id,telegram_user_id,provider,query_key,query_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)").bind(id, userId, parsed.provider, queryKey, queryJson, now(), expiresAt).run();
+  try {
+    await env.DB.prepare("INSERT INTO watches(id,telegram_user_id,provider,query_key,query_json,created_at,expires_at) VALUES(?,?,?,?,?,?,?)").bind(id, userId, parsed.provider, queryKey, queryJson, now(), expiresAt).run();
+  } catch {
+    await send(env, bot, chatId, "같은 알림이 이미 등록되어 있어요. /list에서 확인해 주세요.");
+    return false;
+  }
   await send(env, bot, chatId, watchConfirmation(parsed, id));
   return true;
 }
 
 function watchConfirmation(watch: { provider: Provider; query: Record<string, string> }, id: string): string {
   const { provider, query } = watch;
-  if (provider === "bus") return `✅ 버스 알림을 등록했어요!\n📊 5분마다 확인해요.\n중지: /stop #${shortWatchId(id)}`;
+  if (provider === "bus") return `✅ 버스 알림을 등록했어요!\n📊 5분마다 확인을 시도해요.\n중지: /stop #${shortWatchId(id)}`;
   const room = provider === "srt" ? "일반실·특실" : query.room === "general" ? "일반실" : query.room === "special" ? "특실" : "일반실·특실";
-  return `✅ ${provider.toUpperCase()} 알림을 등록했어요!\n${query.departure} → ${query.arrival}\n📅 ${displayDate(query.date)}  🕐 ${displayTime(query.start_time)}–${displayTime(query.end_time)} · ${room}\n📊 5분마다 확인해요.\n중지: /stop #${shortWatchId(id)}`;
+  return `✅ ${provider.toUpperCase()} 알림을 등록했어요!\n${query.departure} → ${query.arrival}\n📅 ${displayDate(query.date)}  🕐 ${displayTime(query.start_time)}–${displayTime(query.end_time)} · ${room}\n📊 5분마다 확인을 시도해요.\n중지: /stop #${shortWatchId(id)}`;
 }
 
 function displayDate(value: string): string {
@@ -405,12 +416,15 @@ async function listUsers(env: Env, bot: Bot, chatId: number): Promise<void> {
 }
 
 async function userStatusMessage(env: Env): Promise<string> {
-  const [open, pending, dead] = await Promise.all([
+  const [open, pending, dead, slots] = await Promise.all([
     registrationOpen(env),
     env.DB.prepare("SELECT COUNT(*) AS count FROM outbox WHERE status='pending'").first<{ count: number }>(),
     env.DB.prepare("SELECT COUNT(*) AS count FROM outbox WHERE status='dead-letter'").first<{ count: number }>(),
+    Promise.all((["bus", "srt", "ktx"] as Provider[]).map(async (provider) => [provider, await env.DB.prepare("SELECT status,attempt,scheduled_for FROM poll_slots WHERE provider=? AND scheduled_for NOT LIKE 'manual:%' ORDER BY scheduled_for DESC LIMIT 1").bind(provider).first<{ status: string; attempt: number; scheduled_for: string }>()] as const)),
   ]);
-  return `📊 운영 상태\n새 알림 등록: ${open ? "가능" : "일시 중지"}\n전송 대기 메시지: ${pending?.count ?? 0}건\n확인이 필요한 전송 실패: ${dead?.count ?? 0}건`;
+  const labels: Record<Provider, string> = { bus: "버스", srt: "SRT", ktx: "KTX" };
+  const attempts = slots.map(([provider, slot]) => `${labels[provider]}: ${slot ? `${slot.status} · ${slot.attempt}회차` : "기록 없음"}`).join("\n");
+  return `📊 운영 상태\n새 알림 등록: ${open ? "가능" : "일시 중지"}\n전송 대기 메시지: ${pending?.count ?? 0}건\n확인이 필요한 전송 실패: ${dead?.count ?? 0}건\n최근 5분 확인 시도\n${attempts}`;
 }
 
 async function setRegistration(env: Env, bot: Bot, chatId: number, open: boolean): Promise<void> {
@@ -427,67 +441,107 @@ async function send(env: Env, bot: Bot, chatId: number, text: string): Promise<v
   await env.DB.prepare("INSERT INTO outbox(id,bot,chat_id,body_json,next_attempt_at,created_at) VALUES(?,?,?,?,?,?)").bind(crypto.randomUUID(), bot, chatId, JSON.stringify({ text: text.slice(0, 4000) }), now(), now()).run();
 }
 
+type PollClaim = { provider?: Provider; run_id?: string; scheduled_for?: string; source?: string; attempt?: number };
+
 async function claim(request: Request, env: Env): Promise<Response> {
-  const body = await bodyJson<{ provider?: Provider; run_id?: string }>(request);
-  if (!body || !validProvider(body.provider) || !validRunId(body.run_id)) return json({ error: "bad request" }, 400);
+  const body = await bodyJson<PollClaim>(request);
+  if (!body || !validProvider(body.provider) || !validRunId(body.run_id) || !validPollSource(body.source) || !validAttempt(body.attempt)) return json({ error: "bad request" }, 400);
   const timestamp = now();
-  const expired = await env.DB.prepare("SELECT run_id FROM poll_runs WHERE status='leased' AND leased_until<?").bind(timestamp).all<{ run_id: string }>();
-  await env.DB.prepare("UPDATE poll_runs SET status='expired' WHERE status='leased' AND leased_until<?").bind(timestamp).run();
-  for (const _ of expired.results) await incrementSetting(env, "slow_run_streak");
+  await expireLeases(env, timestamp);
+  const scheduledFor = normalizeSlot(body.scheduled_for);
+  if (body.scheduled_for !== undefined && !scheduledFor) return json({ error: "bad request" }, 400);
+  // Existing GitHub workflow_dispatch callers send only provider/run_id. Give
+  // each of those a private slot so they still work repeatedly in one 5-min window.
+  const slot = scheduledFor ?? `manual:${body.run_id}`;
+  const source = body.source ?? "github";
+  const attempt = body.attempt ?? 1;
   const limit = 10;
   const rows = await env.DB.prepare("SELECT query_key,query_json FROM watches WHERE provider=? AND expires_at>? GROUP BY query_key,query_json ORDER BY COALESCE(MIN(last_polled_at), MIN(created_at)) LIMIT ?").bind(body.provider, timestamp, limit + 1).all<{ query_key: string; query_json: string }>();
   await writeSetting(env, `poll_backlog_${body.provider}`, Math.max(0, rows.results.length - limit));
-  if (rows.results.length === 0) return json({ claimed: false, reason: "no_work" });
+  if (rows.results.length === 0) {
+    await recordNoWork(env, body.provider, slot, source, attempt, timestamp);
+    return json({ claimed: false, reason: "no_work", ...(scheduledFor ? { scheduled_for: scheduledFor } : {}) });
+  }
   const work: ClaimedWork[] = [];
   for (const row of rows.results.slice(0, limit)) {
     try { work.push({ query_key: row.query_key, query: JSON.parse(row.query_json) }); } catch { return json({ error: "corrupt watch" }, 500); }
   }
+  const existingSlot = await env.DB.prepare("SELECT status,attempt FROM poll_slots WHERE provider=? AND scheduled_for=?").bind(body.provider, slot).first<{ status: string; attempt: number }>();
+  if (existingSlot && !(existingSlot.status === "failed" && attempt > existingSlot.attempt)) {
+    return json({ claimed: false, reason: existingSlot.status === "no_work" ? "no_work" : existingSlot.status === "leased" ? "already_leased" : "already_completed", ...(scheduledFor ? { scheduled_for: scheduledFor } : {}) });
+  }
   const lease = crypto.randomUUID();
   const until = new Date(Date.now() + 4 * 60_000).toISOString();
   try {
-    await env.DB.prepare("INSERT INTO poll_runs(run_id,provider,lease_token_hash,leased_until,claimed_query_keys,status,created_at) VALUES(?,?,?,?,?,?,?)").bind(body.run_id, body.provider, await sha256(lease), until, JSON.stringify(work.map((item) => item.query_key)), "leased", timestamp).run();
-  } catch { return json({ claimed: false, reason: "already_leased" }); }
-  return json({ claimed: true, lease_token: lease, expires_at: until, work });
+    if (existingSlot) {
+      await env.DB.prepare("UPDATE poll_slots SET status='leased',source=?,attempt=?,run_id=?,updated_at=?,completed_at=NULL WHERE provider=? AND scheduled_for=? AND status='failed' AND attempt<?").bind(source, attempt, body.run_id, timestamp, body.provider, slot, attempt).run();
+    } else {
+      await env.DB.prepare("INSERT INTO poll_slots(provider,scheduled_for,status,source,attempt,run_id,updated_at) VALUES(?,?,?,?,?,?,?)").bind(body.provider, slot, "leased", source, attempt, body.run_id, timestamp).run();
+    }
+    await env.DB.prepare("INSERT INTO poll_runs(run_id,provider,lease_token_hash,leased_until,claimed_query_keys,status,created_at,scheduled_for,source,attempt) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(body.run_id, body.provider, await sha256(lease), until, JSON.stringify(work.map((item) => item.query_key)), "leased", timestamp, scheduledFor, source, attempt).run();
+  } catch {
+    await env.DB.prepare("UPDATE poll_slots SET status='failed',updated_at=?,completed_at=? WHERE provider=? AND scheduled_for=? AND run_id=? AND status='leased'").bind(timestamp, timestamp, body.provider, slot, body.run_id).run();
+    return json({ claimed: false, reason: "already_leased", ...(scheduledFor ? { scheduled_for: scheduledFor } : {}) });
+  }
+  return json({ claimed: true, lease_token: lease, expires_at: until, ...(scheduledFor ? { scheduled_for: scheduledFor } : {}), work });
 }
 
 async function result(request: Request, env: Env): Promise<Response> {
   const body = await bodyJson<{ run_id?: string; lease_token?: string; provider?: Provider; observations?: unknown }>(request);
   if (!body || !validProvider(body.provider) || !validRunId(body.run_id) || typeof body.lease_token !== "string" || !validObservations(body.observations)) return json({ error: "bad request" }, 400);
-  const run = await env.DB.prepare("SELECT lease_token_hash,leased_until,status,provider,claimed_query_keys,created_at FROM poll_runs WHERE run_id=?").bind(body.run_id).first<{ lease_token_hash: string; leased_until: string; status: string; provider: Provider; claimed_query_keys: string; created_at: string }>();
-  if (!run || run.status !== "leased" || run.provider !== body.provider || run.leased_until <= now() || !constantTimeEqual(await sha256(body.lease_token), run.lease_token_hash)) return json({ accepted: false }, 409);
+  const run = await env.DB.prepare("SELECT lease_token_hash,leased_until,status,provider,claimed_query_keys,created_at,scheduled_for,result_hash FROM poll_runs WHERE run_id=?").bind(body.run_id).first<{ lease_token_hash: string; leased_until: string; status: string; provider: Provider; claimed_query_keys: string; created_at: string; scheduled_for: string | null; result_hash: string | null }>();
+  if (!run || run.provider !== body.provider || !constantTimeEqual(await sha256(body.lease_token), run.lease_token_hash)) return json({ accepted: false }, 409);
   let expected: string[];
   try { expected = JSON.parse(run.claimed_query_keys); } catch { return json({ accepted: false }, 409); }
   const actual = body.observations.map((observation) => observation.query_key).sort();
   if (expected.sort().join(",") !== actual.join(",")) return json({ accepted: false, error: "incomplete result" }, 409);
-  const alerts = await applyObservations(env, body.provider, body.observations);
+  const resultHash = await observationHash(body.provider, body.observations);
+  if (run.status === "accepted" && run.result_hash === resultHash) return json({ accepted: true, idempotent: true });
+  if (run.status !== "leased" || run.leased_until <= now()) return json({ accepted: false }, 409);
   const acceptedAt = now();
   const durationMs = Math.max(0, Date.parse(acceptedAt) - Date.parse(run.created_at));
-  await env.DB.prepare("UPDATE poll_runs SET status='accepted',accepted_at=?,duration_ms=? WHERE run_id=? AND status='leased'").bind(acceptedAt, durationMs, body.run_id).run();
+  const won = await env.DB.prepare("UPDATE poll_runs SET status='accepted',accepted_at=?,duration_ms=?,result_hash=? WHERE run_id=? AND status='leased'").bind(acceptedAt, durationMs, resultHash, body.run_id).run();
+  if (!won.meta.changes) {
+    const stored = await env.DB.prepare("SELECT status,result_hash FROM poll_runs WHERE run_id=?").bind(body.run_id).first<{ status: string; result_hash: string | null }>();
+    return stored?.status === "accepted" && stored.result_hash === resultHash ? json({ accepted: true, idempotent: true }) : json({ accepted: false }, 409);
+  }
+  let alerts: number;
+  try {
+    alerts = await applyObservations(env, body.provider, body.observations, body.run_id, resultHash);
+  } catch (error) {
+    await markRunFailed(env, body.provider, body.run_id, run.scheduled_for, String(error));
+    throw error;
+  }
+  await updateSlot(env, body.provider, run.scheduled_for ?? `manual:${body.run_id}`, "accepted", acceptedAt, body.run_id);
   await recordSuccessfulRun(env, durationMs);
   await flushOutbox(env);
   return json({ accepted: true, observation_count: body.observations.length, alert_count: alerts });
 }
 
-async function applyObservations(env: Env, provider: Provider, observations: QueryObservation[]): Promise<number> {
+async function applyObservations(env: Env, provider: Provider, observations: QueryObservation[], runId: string, resultHash: string): Promise<number> {
   let alerts = 0;
   const timestamp = now();
+  const statements: D1PreparedStatement[] = [];
   for (const observation of observations) {
     const watches = await env.DB.prepare("SELECT id,telegram_user_id,query_json FROM watches WHERE provider=? AND query_key=? AND expires_at>?").bind(provider, observation.query_key, timestamp).all<{ id: string; telegram_user_id: number; query_json: string }>();
     for (const watch of watches.results) {
       const query = alertQuery(watch.query_json);
       for (const seat of observation.seats) {
         const previous = await env.DB.prepare("SELECT available FROM seat_states WHERE watch_id=? AND seat_key=?").bind(watch.id, seat.key).first<{ available: number }>();
-        await env.DB.prepare("INSERT INTO seat_states(watch_id,seat_key,available,updated_at) VALUES(?,?,?,?) ON CONFLICT(watch_id,seat_key) DO UPDATE SET available=excluded.available,updated_at=excluded.updated_at").bind(watch.id, seat.key, seat.available ? 1 : 0, timestamp).run();
+        statements.push(env.DB.prepare("INSERT INTO seat_states(watch_id,seat_key,available,updated_at) VALUES(?,?,?,?) ON CONFLICT(watch_id,seat_key) DO UPDATE SET available=excluded.available,updated_at=excluded.updated_at").bind(watch.id, seat.key, seat.available ? 1 : 0, timestamp));
         if (!shouldNotify(previous?.available === 1 ? true : previous ? false : undefined, seat.available)) continue;
         const chats = await env.DB.prepare("SELECT chat_id,bot FROM chats WHERE telegram_user_id=? AND bot=?").bind(watch.telegram_user_id, provider === "bus" ? "bus" : "rail").all<{ chat_id: number; bot: Bot }>();
         for (const chat of chats.results) {
-          await send(env, chat.bot, chat.chat_id, availabilityAlert(provider, query, seat));
+          const text = availabilityAlert(provider, query, seat);
+          const id = await sha256(`availability:${runId}:${resultHash}:${watch.id}:${seat.key}:${chat.bot}:${chat.chat_id}`);
+          statements.push(env.DB.prepare("INSERT OR IGNORE INTO outbox(id,bot,chat_id,body_json,next_attempt_at,created_at) VALUES(?,?,?,?,?,?)").bind(id, chat.bot, chat.chat_id, JSON.stringify({ text: text.slice(0, 4000) }), timestamp, timestamp));
           alerts++;
         }
       }
-      await env.DB.prepare("UPDATE watches SET last_polled_at=? WHERE id=?").bind(timestamp, watch.id).run();
+      statements.push(env.DB.prepare("UPDATE watches SET last_polled_at=? WHERE id=?").bind(timestamp, watch.id));
     }
   }
+  if (statements.length) await env.DB.batch(statements);
   return alerts;
 }
 
@@ -525,17 +579,60 @@ function busAvailabilityAlert(query: Record<string, string>, seat: SeatObservati
 
 async function maintenance(env: Env): Promise<Response> {
   const timestamp = now();
-  const expired = await env.DB.prepare("SELECT run_id FROM poll_runs WHERE status='leased' AND leased_until<?").bind(timestamp).all<{ run_id: string }>();
+  const expired = await expireLeases(env, timestamp);
   await env.DB.batch([
-    env.DB.prepare("UPDATE poll_runs SET status='expired' WHERE status='leased' AND leased_until<?").bind(timestamp),
     env.DB.prepare("DELETE FROM watches WHERE expires_at<?").bind(timestamp),
     env.DB.prepare("DELETE FROM conversations WHERE expires_at<?").bind(timestamp),
     env.DB.prepare("DELETE FROM seat_states WHERE watch_id NOT IN (SELECT id FROM watches)"),
     env.DB.prepare("UPDATE outbox SET status='dead-letter' WHERE attempts>=5 AND status='pending'"),
   ]);
-  for (const _ of expired.results) await incrementSetting(env, "slow_run_streak");
   await flushOutbox(env);
-  return json({ ok: true, expired_leases: expired.results.length });
+  return json({ ok: true, expired_leases: expired });
+}
+
+async function fail(request: Request, env: Env): Promise<Response> {
+  const body = await bodyJson<{ provider?: Provider; run_id?: string; lease_token?: string; reason?: string }>(request);
+  if (!body || !validProvider(body.provider) || !validRunId(body.run_id) || typeof body.lease_token !== "string" || body.lease_token.length === 0 || (body.reason !== undefined && (typeof body.reason !== "string" || body.reason.length > 200))) return json({ error: "bad request" }, 400);
+  const run = await env.DB.prepare("SELECT lease_token_hash,scheduled_for FROM poll_runs WHERE run_id=? AND provider=? AND status='leased'").bind(body.run_id, body.provider).first<{ lease_token_hash: string; scheduled_for: string | null }>();
+  if (!run || !constantTimeEqual(await sha256(body.lease_token), run.lease_token_hash)) return json({ failed: false }, 409);
+  const timestamp = now();
+  const closed = await env.DB.prepare("UPDATE poll_runs SET status='failed',leased_until=?,failure_reason=? WHERE run_id=? AND provider=? AND status='leased' AND lease_token_hash=?").bind(timestamp, body.reason ?? "poller reported failure", body.run_id, body.provider, run.lease_token_hash).run();
+  if (!closed.meta.changes) return json({ failed: false }, 409);
+  await updateSlot(env, body.provider, run.scheduled_for ?? `manual:${body.run_id}`, "failed", timestamp, body.run_id);
+  await incrementSetting(env, "slow_run_streak");
+  return json({ failed: true });
+}
+
+async function expireLeases(env: Env, timestamp: string): Promise<number> {
+  const expired = await env.DB.prepare("SELECT run_id,provider,scheduled_for FROM poll_runs WHERE status='leased' AND leased_until<?").bind(timestamp).all<{ run_id: string; provider: Provider; scheduled_for: string | null }>();
+  if (!expired.results.length) return 0;
+  const statements: D1PreparedStatement[] = [env.DB.prepare("UPDATE poll_runs SET status='expired',failure_reason='lease expired' WHERE status='leased' AND leased_until<?").bind(timestamp)];
+  for (const run of expired.results) statements.push(env.DB.prepare("UPDATE poll_slots SET status='failed',updated_at=?,completed_at=? WHERE provider=? AND scheduled_for=? AND run_id=? AND status='leased'").bind(timestamp, timestamp, run.provider, run.scheduled_for ?? `manual:${run.run_id}`, run.run_id));
+  await env.DB.batch(statements);
+  for (const _ of expired.results) await incrementSetting(env, "slow_run_streak");
+  return expired.results.length;
+}
+
+async function recordNoWork(env: Env, provider: Provider, slot: string, source: string, attempt: number, timestamp: string): Promise<void> {
+  await env.DB.prepare("INSERT INTO poll_slots(provider,scheduled_for,status,source,attempt,run_id,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(provider,scheduled_for) DO UPDATE SET status='no_work',source=excluded.source,attempt=excluded.attempt,run_id=NULL,updated_at=excluded.updated_at,completed_at=excluded.completed_at WHERE poll_slots.status='failed' AND poll_slots.attempt<excluded.attempt")
+    .bind(provider, slot, "no_work", source, attempt, null, timestamp, timestamp).run();
+}
+
+async function updateSlot(env: Env, provider: Provider, slot: string, status: "accepted" | "failed", timestamp: string, runId: string): Promise<void> {
+  await env.DB.prepare("UPDATE poll_slots SET status=?,updated_at=?,completed_at=? WHERE provider=? AND scheduled_for=? AND run_id=? AND status='leased'").bind(status, timestamp, timestamp, provider, slot, runId).run();
+}
+
+async function markRunFailed(env: Env, provider: Provider, runId: string, scheduledFor: string | null, reason: string): Promise<void> {
+  const timestamp = now();
+  await env.DB.prepare("UPDATE poll_runs SET status='failed',failure_reason=? WHERE run_id=? AND provider=? AND status='accepted'").bind(reason.slice(0, 200), runId, provider).run();
+  await updateSlot(env, provider, scheduledFor ?? `manual:${runId}`, "failed", timestamp, runId);
+}
+
+async function observationHash(provider: Provider, observations: QueryObservation[]): Promise<string> {
+  const normalized = observations
+    .map((observation) => ({ query_key: observation.query_key, seats: [...observation.seats].sort((a, b) => a.key.localeCompare(b.key)).map((seat) => ({ key: seat.key, available: seat.available, label: seat.label })) }))
+    .sort((a, b) => a.query_key.localeCompare(b.query_key));
+  return sha256(JSON.stringify({ provider, observations: normalized }));
 }
 
 async function flushOutbox(env: Env): Promise<void> {
@@ -637,3 +734,12 @@ async function health(env: Env): Promise<Response> { return json(await status(en
 async function bodyJson<T>(request: Request): Promise<T | null> { try { return await request.json<T>(); } catch { return null; } }
 function validProvider(value: unknown): value is Provider { return value === "bus" || value === "srt" || value === "ktx"; }
 function validRunId(value: unknown): value is string { return typeof value === "string" && /^[A-Za-z0-9._-]{1,200}$/.test(value); }
+function validPollSource(value: unknown): boolean { return value === undefined || (typeof value === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(value)); }
+function validAttempt(value: unknown): boolean { return value === undefined || (Number.isInteger(value) && (value as number) >= 1 && (value as number) <= 2); }
+function normalizeSlot(value: unknown): string | null {
+  if (value === undefined) return null;
+  if (typeof value !== "string") return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf()) || date.valueOf() % 300_000 !== 0) return null;
+  return date.toISOString();
+}

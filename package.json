@@ -11,6 +11,7 @@
     "bootstrap:admin": "bun scripts/bootstrap-admin.ts",
     "build": "node node_modules/wrangler/bin/wrangler.js deploy --dry-run --env staging",
     "poll": "bun src/poll.ts",
+    "poller": "bun src/scheduler.ts",
     "deploy:staging": "node node_modules/wrangler/bin/wrangler.js deploy --env staging",
     "deploy": "node node_modules/wrangler/bin/wrangler.js deploy"
   },
