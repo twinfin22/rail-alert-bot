@@ -61,11 +61,11 @@ const STATION_ALIASES: Record<string, string> = {
   "포항": "Pohang",
 };
 
-export async function searchSrt(query: { departure: string; arrival: string; date: string; start_time: string; end_time: string }): Promise<SrtTrain[]> {
+export async function searchSrt(query: { departure: string; arrival: string; date: string; start_time: string; end_time: string }, signal?: AbortSignal): Promise<SrtTrain[]> {
   const start = normalizeTime(query.start_time);
   const end = normalizeTime(query.end_time);
   if (start > end) throw new Error("SRT start_time must be before end_time");
-  const client = new SrtClient();
+  const client = new SrtClient(signal);
   const stations = await client.loadStations();
   const departure = resolveStation(query.departure, stations);
   const arrival = resolveStation(query.arrival, stations);
@@ -109,6 +109,7 @@ export function parseSrtSchedule(html: string, date: string): SrtTrain[] {
 
 class SrtClient {
   private cookie = "";
+  constructor(private readonly signal?: AbortSignal) {}
 
   async loadStations(): Promise<Map<string, Station>> {
     const html = await this.request("GET", MAIN_PATH);
@@ -154,7 +155,7 @@ class SrtClient {
     };
     if (this.cookie) headers.Cookie = this.cookie;
     if (body) headers["Content-Type"] = "application/x-www-form-urlencoded";
-    const response = await fetch(`${BASE}${path}`, { method, headers, body, signal: AbortSignal.timeout(20_000) });
+    const response = await fetch(`${BASE}${path}`, { method, headers, body, signal: this.signal ?? AbortSignal.timeout(20_000) });
     if (!response.ok) throw new Error(`SRT request failed: ${response.status}`);
     const cookies = response.headers.getSetCookie?.() ?? [];
     if (cookies.length) this.cookie = cookies.map((cookie) => cookie.split(";")[0]).join("; ");

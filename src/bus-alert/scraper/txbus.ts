@@ -43,7 +43,8 @@ export async function searchTerminals(
 export async function getSchedule(
   departureCode: string,
   arrivalCode: string,
-  date: string // YYYYMMDD
+  date: string, // YYYYMMDD
+  signal?: AbortSignal
 ): Promise<BusSchedule[]> {
   const params = new URLSearchParams({
     depr_Trml_Cd: departureCode,
@@ -58,7 +59,7 @@ export async function getSchedule(
     method: "POST",
     headers: HEADERS,
     body: params.toString(),
-    signal: AbortSignal.timeout(10_000),
+    signal: signal ?? AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`txbus schedule fetch failed: ${res.status}`);
 

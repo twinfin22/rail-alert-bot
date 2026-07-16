@@ -1,0 +1,11 @@
+.context
+.git
+.github
+.wrangler
+__pycache__
+*.pyc
+node_modules
+dist
+.dev.vars
+.env
+.env.*
