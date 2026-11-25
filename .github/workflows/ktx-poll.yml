@@ -9,7 +9,7 @@ name: KTX poll
         type: choice
         options: [staging, production]
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2-59/5 * * * *"
 concurrency:
   group: rail-alert-ktx-poll-${{ inputs.environment || 'production' }}
   cancel-in-progress: false
